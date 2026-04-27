@@ -342,7 +342,7 @@ def main():
     # 提取并保存在内存中的预训练字典
     pretrained_weights = global_trainer.pretrain_once(
         subject_ids=subject_ids, 
-        n_epochs=60, 
+        n_epochs=300, 
         batch_size=128
     )
 
@@ -362,7 +362,7 @@ def main():
         
         print(f"  [Subject HC{sub_idx}] 微调最优精度: {best_acc * 100:.2f}% (已保存至 {SAVE_DIR})")
 
-    last_save_path = './EEG-Conformer/last_params/global_pretrain_last_e60.pth'
+    last_save_path = './EEG-Conformer/last_params/global_pretrain_last_e300.pth'
     torch.save(finetuner.model.state_dict(), last_save_path)
     print(f"💾 全局 Last 权重已保存至: {last_save_path}")
 

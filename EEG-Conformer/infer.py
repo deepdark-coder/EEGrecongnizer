@@ -15,7 +15,7 @@ def load_and_preprocess_data(data_path):
     """
     加载数据并执行与训练时完全一致的预处理（Z-score标准化 + 增加通道维）
     """
-    print(f"正在加载验证数据: {data_path}")
+    print(f"=正在加载验证数据: {data_path}")
     mat = sio.loadmat(data_path)
     
     data = np.ascontiguousarray(mat['data'], dtype=np.float32)

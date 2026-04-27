@@ -231,7 +231,7 @@ class ExGAN():
     def __init__(self, nsub, fold):
         super(ExGAN, self).__init__()
         self.batch_size = 200
-        self.n_epochs = 60  #1000
+        self.n_epochs = 60  
         self.img_height = 30
         self.img_width = 250
         self.channels = 1
