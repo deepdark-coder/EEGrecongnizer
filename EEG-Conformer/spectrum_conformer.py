@@ -105,27 +105,24 @@ class ClassificationHead(nn.Module):
     def __init__(self, emb_size: int, n_classes: int, seq_len: int):
         super().__init__()
         self.fc = nn.Sequential(
-            # 【修改点 1】：去掉 seq_len * 的乘法，直接接收 emb_size 维度的输入
-            nn.Linear(emb_size, 32),
+            # 恢复 seq_len * emb_size，接收展平后的完整频率空间
+            nn.Linear(seq_len * emb_size, 64), 
             nn.ELU(),
-            nn.Dropout(0.5), # 顺手把这里的 Dropout 从 0.3 提高到 0.5，进一步抑制过拟合
-            nn.Linear(32, n_classes),
+            nn.Dropout(0.5),
+            nn.Linear(64, n_classes),
         )
     def forward(self, x: Tensor):
-        # x 的输入形状: (Batch, seq_len, emb_size)
-        
-        # 【修改点 2】：用 Global Average Pooling (GAP) 替代原来的 view 展平操作
-        # 对 seq_len 维度求平均，输出形状变为 (Batch, emb_size)
-        feat = x.mean(dim=1) 
-        
+        # 取消 GAP，恢复 Flatten
+        feat = x.contiguous().view(x.size(0), -1)
         return feat, self.fc(feat)
 
 class ViT(nn.Module):
-    def __init__(self, emb_size: int = 16, depth: int = 2,
-                 n_classes: int = 2, n_channels: int = 30, seq_len: int = 11):
+    def __init__(self, emb_size: int = 24, depth: int = 2,
+                 n_classes: int = 2, n_channels: int = 30, seq_len: int = 50):
         super().__init__()
         self.patch_embedding = PatchEmbedding(emb_size, n_channels)
         self.transformer     = TransformerEncoder(depth, emb_size)
+        # 将 seq_len 传给分类头
         self.cls_head        = ClassificationHead(emb_size, n_classes, seq_len)
 
     def forward(self, x: Tensor):
@@ -166,14 +163,9 @@ class ExGAN:
         
         idx = np.where((freqs >= 1) & (freqs <= 50))[0]
         psd_features = power_spectrum[:, :, idx]
-        log_psd = np.log10(psd_features + 1e-8)
         
-        # 核心改动：Trial-wise Instance Normalization
-        # 沿着频率维度 (axis=2) 求均值和标准差
-        # 彻底抹平个体头骨厚度、设备阻抗带来的绝对能量差异，只保留相对形态！
-        mu = np.mean(log_psd, axis=2, keepdims=True)
-        std = np.std(log_psd, axis=2, keepdims=True) + 1e-8
-        log_psd = (log_psd - mu) / std
+        # 仅取对数，删除这里所有关于 mu 和 std 的 Trial-wise 标准化代码
+        log_psd = np.log10(psd_features + 1e-8)
         
         return log_psd
 
@@ -213,10 +205,13 @@ class ExGAN:
         train_data,  train_label = all_data[train_idx], all_label[train_idx]
         test_data,   test_label  = all_data[test_idx],  all_label[test_idx]
 
+        # 【核心恢复】：受试者专属的全局 Z-score 标准化
+        mu, std    = train_data.mean(), train_data.std() + 1e-8
+        train_data = (train_data - mu) / std
+        test_data  = (test_data  - mu) / std
+
         train_data  = np.ascontiguousarray(train_data[:, np.newaxis], dtype=np.float32)
         test_data   = np.ascontiguousarray(test_data[:,  np.newaxis], dtype=np.float32)
-        train_label = np.ascontiguousarray(train_label, dtype=np.int64)
-        test_label  = np.ascontiguousarray(test_label,  dtype=np.int64)
 
         return train_data, train_label, test_data, test_label
 

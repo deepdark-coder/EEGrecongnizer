@@ -372,7 +372,12 @@ class ExGAN:
         return best_acc
 
 
-# ════════════════════════════ 主函数入口 ═════════════════════════════════════
+def read_data(data_dir: str):
+    subject_ids = sorted([
+        int(os.path.basename(f).replace('HC', '').replace('_1s.mat', ''))
+        for f in glob.glob(os.path.join(data_dir, 'HC*_1s.mat'))
+    ])
+    return subject_ids
 
 def main():
     DATA_DIR = "./EEG-Conformer/data/processed_normal/"
@@ -381,10 +386,7 @@ def main():
     depth   = 2
     
     # 自动扫描受试者列表
-    subject_ids = sorted([
-        int(os.path.basename(f).replace('HC', '').replace('_1s.mat', ''))
-        for f in glob.glob(os.path.join(DATA_DIR, 'HC*_1s.mat'))
-    ])
+    subject_ids = read_data(DATA_DIR)
     n_subjects = len(subject_ids)
     
     if n_subjects == 0:
