@@ -37,18 +37,30 @@ def denoise_signals(all_data):
 
 '''emb_size=16,depth=1修改需要从EXGAN中的参数中修改'''
 class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size: int = 16, n_channels: int = 30):
+    def __init__(self, emb_size: int = 24, n_channels: int = 30):
         super().__init__()
         self.shallownet = nn.Sequential(
-            nn.Conv2d(1, 40, (1, 25), stride=(1, 1)),
-            nn.Conv2d(40, 40, (n_channels, 1), stride=(1, 1)),
-            nn.BatchNorm2d(40),
+            # 1. 时间维度卷积 (捕捉时域局部特征)
+            nn.Conv2d(1, 64, (1, 25), stride=(1, 1)),
             nn.ELU(),
-            nn.AvgPool2d((1, 75), stride=(1, 15)),
-            nn.Dropout(0.5),
+
+            # 2. 空间维度卷积 (融合 30 个电极通道)
+            nn.Conv2d(64, 64, (n_channels, 1), stride=(1, 1)),
+            nn.GroupNorm(8, 64),
+            nn.ELU(),
+
+            # 3. 额外时域精炼 (在空间融合后再做一次局部时序建模)
+            nn.Conv2d(64, 64, (1, 5), stride=(1, 1), padding=(0, 2)),
+            nn.GroupNorm(8, 64),
+            nn.ELU(),
+
+            # 4. 平滑池化降维
+            nn.AvgPool2d((1, 4), stride=(1, 2)),
+
+            nn.Dropout(0.2),
         )
         self.projection = nn.Sequential(
-            nn.Conv2d(40, emb_size, (1, 1), stride=(1, 1)),
+            nn.Conv2d(64, emb_size, (1, 1), stride=(1, 1)),
             Rearrange('b e h w -> b (h w) e'),
         )
 
@@ -73,9 +85,25 @@ class MultiHeadAttention(nn.Module):
         energy = torch.einsum('bhqd, bhkd -> bhqk', q, k)
         if mask is not None:
             energy = energy.masked_fill_(~mask, torch.finfo(torch.float32).min)
-        att = self.att_drop(F.softmax(energy / self.emb_size ** 0.5, dim=-1))
+        att = self.att_drop(F.softmax(energy / (self.emb_size / self.num_heads) ** 0.5, dim=-1))
         out = torch.einsum('bhal, bhlv -> bhav', att, v)
         return self.projection(rearrange(out, "b h n d -> b n (h d)"))
+
+class DropPath(nn.Module):
+    """Stochastic Depth — 训练时随机丢弃整条残差分支，防止过拟合。"""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x / keep_prob * random_tensor
+
 
 class ResidualAdd(nn.Module):
     def __init__(self, fn):
@@ -93,51 +121,115 @@ class FeedForwardBlock(nn.Sequential):
             nn.Linear(expansion * emb_size, emb_size),
         )
 
-class TransformerEncoderBlock(nn.Sequential):
-    def __init__(self, emb_size: int, num_heads: int = 4,
-                 drop_p: float = 0.5, forward_expansion: int = 4,
-                 forward_drop_p: float = 0.5):
-        super().__init__(
-            ResidualAdd(nn.Sequential(
-                nn.LayerNorm(emb_size),
-                MultiHeadAttention(emb_size, num_heads, drop_p),
-                nn.Dropout(drop_p),
-            )),
-            ResidualAdd(nn.Sequential(
-                nn.LayerNorm(emb_size),
-                FeedForwardBlock(emb_size, expansion=forward_expansion,
-                                 drop_p=forward_drop_p),
-                nn.Dropout(drop_p),
-            )),
+class ConvolutionModule(nn.Module):
+    """Conformer 卷积模块: 逐点卷积 → GLU → 深度可分离卷积 → 逐点卷积"""
+    def __init__(self, emb_size: int, kernel_size: int = 31, dropout: float = 0.1):
+        super().__init__()
+        self.layer_norm = nn.LayerNorm(emb_size)
+        self.pointwise_conv1 = nn.Conv1d(emb_size, emb_size * 2, 1)
+        self.glu = nn.GLU(dim=1)
+        self.depthwise_conv = nn.Conv1d(
+            emb_size, emb_size, kernel_size,
+            padding=kernel_size // 2, groups=emb_size
         )
+        self.batch_norm = nn.BatchNorm1d(emb_size)
+        self.swish = nn.SiLU()
+        self.pointwise_conv2 = nn.Conv1d(emb_size, emb_size, 1)
+        self.dropout = nn.Dropout(dropout)
 
-class TransformerEncoder(nn.Sequential):
-    def __init__(self, depth: int, emb_size: int):
-        super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, T, D)
+        residual = x
+        x = self.layer_norm(x)
+        x = x.transpose(1, 2)                      # (B, D, T)
+        x = self.pointwise_conv1(x)
+        x = self.glu(x)
+        x = self.depthwise_conv(x)
+        x = self.batch_norm(x)
+        x = self.swish(x)
+        x = self.pointwise_conv2(x)
+        x = self.dropout(x)
+        x = x.transpose(1, 2)                      # (B, T, D)
+        return residual + x
+
+
+class ConformerBlock(nn.Module):
+    """Conformer Block: FFN/2 → MHSA → Conv → FFN/2 → LayerNorm"""
+    def __init__(self, emb_size: int, num_heads: int = 4,
+                 drop_p: float = 0.1, forward_expansion: int = 4,
+                 forward_drop_p: float = 0.1, drop_path: float = 0.0,
+                 conv_kernel: int = 31):
+        super().__init__()
+        self.ffn1 = ResidualAdd(nn.Sequential(
+            nn.LayerNorm(emb_size),
+            FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
+            nn.Dropout(drop_p),
+            DropPath(drop_path),
+        ))
+        self.mhsa = ResidualAdd(nn.Sequential(
+            nn.LayerNorm(emb_size),
+            MultiHeadAttention(emb_size, num_heads, drop_p),
+            nn.Dropout(drop_p),
+            DropPath(drop_path),
+        ))
+        self.conv = ConvolutionModule(emb_size, conv_kernel, drop_p)
+        self.ffn2 = ResidualAdd(nn.Sequential(
+            nn.LayerNorm(emb_size),
+            FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
+            nn.Dropout(drop_p),
+            DropPath(drop_path),
+        ))
+        self.final_norm = nn.LayerNorm(emb_size)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + 0.5 * self.ffn1.fn(x)
+        x = self.mhsa(x)
+        x = self.conv(x)
+        x = x + 0.5 * self.ffn2.fn(x)
+        x = self.final_norm(x)
+        return x
+
+
+class ConformerEncoder(nn.Sequential):
+    def __init__(self, depth: int, emb_size: int, drop_path_max: float = 0.2):
+        drop_path_rates = [drop_path_max * i / (depth - 1) for i in range(depth)] if depth > 1 else [0.0]
+        super().__init__(*[
+            ConformerBlock(emb_size, drop_path=drop_path_rates[i])
+            for i in range(depth)
+        ])
 
 class ClassificationHead(nn.Module):
-    def __init__(self, emb_size: int, n_classes: int, seq_len: int):
+    # 移除 seq_len 参数，因为输入会被 GAP 压缩
+    def __init__(self, emb_size: int, n_classes: int):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(seq_len * emb_size, 32),
+            # 直接接收 emb_size，例如扩容后的 40 维
+            nn.Linear(emb_size, 32),
             nn.ELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2), # 维持高 Dropout
             nn.Linear(32, n_classes),
         )
+        
     def forward(self, x: Tensor):
-        feat = x.contiguous().view(x.size(0), -1)
+        # x 的输入形状: (Batch, seq_len=112, emb_size=40)
+        
+        # 核心：将 112 个时间步的特征融合为一个 40 维的全局时间不变特征
+        feat = x.mean(dim=1) 
+        
         return feat, self.fc(feat)
 
 class ViT(nn.Module):
-    def __init__(self, emb_size: int = 16, depth: int = 2,
+    def __init__(self, emb_size: int, depth: int,
                  n_classes: int = 2, n_channels: int = 30, seq_len: int = 11):
         super().__init__()
         self.patch_embedding = PatchEmbedding(emb_size, n_channels)
-        self.transformer     = TransformerEncoder(depth, emb_size)
-        self.cls_head        = ClassificationHead(emb_size, n_classes, seq_len)
+        self.pos_embedding   = nn.Parameter(torch.randn(1, seq_len, emb_size) * 0.02)
+        self.transformer     = ConformerEncoder(depth, emb_size)
+        self.cls_head        = ClassificationHead(emb_size, n_classes)
 
     def forward(self, x: Tensor):
         x = self.patch_embedding(x)
+        x = x + self.pos_embedding
         x = self.transformer(x)
         return self.cls_head(x)
 
@@ -155,7 +247,7 @@ class ExGAN:
         self.depth      = depth
         self.emb_size    = emb_size
 
-        self.criterion_cls = nn.CrossEntropyLoss().cuda()
+        self.criterion_cls = nn.CrossEntropyLoss(label_smoothing=0.1).cuda()
 
         self.model = ViT(
             emb_size=self.emb_size, depth=self.depth, n_classes=self.n_classes,
@@ -173,6 +265,20 @@ class ExGAN:
         with torch.no_grad():
             out = pe(dummy)
         return out.shape[1]
+
+    @staticmethod
+    def augment(x: Tensor) -> Tensor:
+        """EEG 数据增强: 高斯噪声 + 随机时间偏移 + 通道丢弃 (仅训练时调用)"""
+        # 1. 高斯噪声 (σ=0.02)
+        x = x + torch.randn_like(x) * 0.02
+        # 2. 随机时间偏移 (±25 采样点, 即 ±10% 窗口)
+        shift = torch.randint(-25, 25, (1,), device=x.device).item()
+        x = torch.roll(x, shift, dims=-1)
+        # 3. 30% 概率触发通道丢弃 (丢弃约 10% 通道)
+        if torch.rand(1, device=x.device).item() < 0.3:
+            mask = (torch.rand(x.size(0), 1, x.size(2), 1, device=x.device) > 0.1).float()
+            x = x * mask
+        return x
 
     # ── 新增：固定的 80/20 数据切分 (弃用多折) ──────────────────────────────
     def _get_train_test_data(self, sid: int):
@@ -205,8 +311,9 @@ class ExGAN:
         train_data,  train_label = all_data[train_idx], all_label[train_idx]
         test_data,   test_label  = all_data[test_idx],  all_label[test_idx]
 
-        # 用训练集统计量标准化 (按通道维度标准化更优，这里保持与之前一致的全量标准化)
-        mu, std    = train_data.mean(), train_data.std() + 1e-8
+        # 按通道标准化 (每通道独立均值和标准差)
+        mu    = train_data.mean(axis=(0, 2), keepdims=True)
+        std   = train_data.std(axis=(0, 2), keepdims=True) + 1e-8
         train_data = (train_data - mu) / std
         test_data  = (test_data  - mu) / std
 
@@ -259,8 +366,8 @@ class ExGAN:
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader   = torch.utils.data.DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2), weight_decay=1e-4) # 增加了一点 L2 正则化
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2), weight_decay=5e-4)
+        scheduler = warmup_cosine_scheduler(optimizer, warmup_epochs=5, total_epochs=n_epochs)
 
         best_val_acc = 0.0
         patience_counter = 0
@@ -275,11 +382,13 @@ class ExGAN:
             
             for imgs, labels in train_loader:
                 imgs, labels = imgs.cuda(), labels.cuda()
+                imgs = ExGAN.augment(imgs)
                 _, outputs   = self.model(imgs)
                 loss         = self.criterion_cls(outputs, labels)
-                
+
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
                 train_loss    += loss.item() * len(imgs)
@@ -340,7 +449,7 @@ class ExGAN:
 
         finetune_lr = self.lr * 0.1
         optimizer   = torch.optim.Adam(self.model.parameters(), lr=finetune_lr, betas=(self.b1, self.b2))
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
+        scheduler = warmup_cosine_scheduler(optimizer, warmup_epochs=2, total_epochs=n_epochs)
 
         best_acc = 0.0
         # 定义该被试的专属权重保存路径
@@ -350,10 +459,12 @@ class ExGAN:
             self.model.train()
             for imgs, labels in loader:
                 imgs, labels = imgs.cuda(), labels.cuda()
+                imgs = ExGAN.augment(imgs)
                 _, outputs   = self.model(imgs)
                 loss         = self.criterion_cls(outputs, labels)
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
             scheduler.step()
 
@@ -372,6 +483,16 @@ class ExGAN:
         return best_acc
 
 
+def warmup_cosine_scheduler(optimizer, warmup_epochs: int, total_epochs: int):
+    """前 warmup_epochs 线性升温，之后余弦退火。"""
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def read_data(data_dir: str):
     subject_ids = sorted([
         int(os.path.basename(f).replace('HC', '').replace('_1s.mat', ''))
@@ -382,7 +503,7 @@ def read_data(data_dir: str):
 def main():
     DATA_DIR = "./EEG-Conformer/data/processed_normal/"
     SAVE_DIR = "./EEG-Conformer/last_params/"
-    emb_size = 24
+    emb_size = 40
     depth   = 2
     
     # 自动扫描受试者列表
@@ -395,7 +516,7 @@ def main():
         
     print(f"找到 {n_subjects} 个受试者: {subject_ids}")
 
-    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=16)
+    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=emb_size)
     print(f"[Info] 动态推理 seq_len = {seq_len}")
 
     starttime = datetime.datetime.now()

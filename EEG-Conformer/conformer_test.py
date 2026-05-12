@@ -9,7 +9,6 @@ from torch.backends import cudnn
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from pre_denoise import load_and_denoise_data
-from test_kmeans import cluster_subjects_by_baseline
 
 cudnn.benchmark     = False
 cudnn.deterministic = True
@@ -38,15 +37,24 @@ def denoise_signals(all_data):
 
 '''emb_size=16,depth=1修改需要从EXGAN中的参数中修改'''
 class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size: int = 16, n_channels: int = 30):
+    def __init__(self, emb_size: int = 24, n_channels: int = 30):
         super().__init__()
         self.shallownet = nn.Sequential(
+            # 1. 时间维度卷积 (捕捉时域局部特征)
             nn.Conv2d(1, 40, (1, 25), stride=(1, 1)),
+            nn.ELU(),
+
+            # 2. 空间维度卷积 (融合 30 个电极通道)
             nn.Conv2d(40, 40, (n_channels, 1), stride=(1, 1)),
             nn.BatchNorm2d(40),
             nn.ELU(),
-            nn.AvgPool2d((1, 75), stride=(1, 15)),
-            nn.Dropout(0.5),
+
+            # 3. 【核心修改点】：降低池化核与步长
+            # 原本为 nn.AvgPool2d((1, 75), stride=(1, 15))，压缩比太狠
+            # 现改为核大小 4，步长 2。这能极其平滑地降维，保留高频突发特征
+            nn.AvgPool2d((1, 4), stride=(1, 2)),
+
+            nn.Dropout(0.2),
         )
         self.projection = nn.Sequential(
             nn.Conv2d(40, emb_size, (1, 1), stride=(1, 1)),
@@ -74,9 +82,25 @@ class MultiHeadAttention(nn.Module):
         energy = torch.einsum('bhqd, bhkd -> bhqk', q, k)
         if mask is not None:
             energy = energy.masked_fill_(~mask, torch.finfo(torch.float32).min)
-        att = self.att_drop(F.softmax(energy / self.emb_size ** 0.5, dim=-1))
+        att = self.att_drop(F.softmax(energy / (self.emb_size / self.num_heads) ** 0.5, dim=-1))
         out = torch.einsum('bhal, bhlv -> bhav', att, v)
         return self.projection(rearrange(out, "b h n d -> b n (h d)"))
+
+class DropPath(nn.Module):
+    """Stochastic Depth — 训练时随机丢弃整条残差分支，防止过拟合。"""
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        return x / keep_prob * random_tensor
+
 
 class ResidualAdd(nn.Module):
     def __init__(self, fn):
@@ -96,56 +120,71 @@ class FeedForwardBlock(nn.Sequential):
 
 class TransformerEncoderBlock(nn.Sequential):
     def __init__(self, emb_size: int, num_heads: int = 4,
-                 drop_p: float = 0.5, forward_expansion: int = 4,
-                 forward_drop_p: float = 0.5):
+                 drop_p: float = 0.1, forward_expansion: int = 4,
+                 forward_drop_p: float = 0.1, drop_path: float = 0.0):
         super().__init__(
             ResidualAdd(nn.Sequential(
                 nn.LayerNorm(emb_size),
                 MultiHeadAttention(emb_size, num_heads, drop_p),
                 nn.Dropout(drop_p),
+                DropPath(drop_path),
             )),
             ResidualAdd(nn.Sequential(
                 nn.LayerNorm(emb_size),
                 FeedForwardBlock(emb_size, expansion=forward_expansion,
                                  drop_p=forward_drop_p),
                 nn.Dropout(drop_p),
+                DropPath(drop_path),
             )),
         )
 
 class TransformerEncoder(nn.Sequential):
-    def __init__(self, depth: int, emb_size: int):
-        super().__init__(*[TransformerEncoderBlock(emb_size) for _ in range(depth)])
+    def __init__(self, depth: int, emb_size: int, drop_path_max: float = 0.2):
+        drop_path_rates = [drop_path_max * i / (depth - 1) for i in range(depth)] if depth > 1 else [0.0]
+        super().__init__(*[
+            TransformerEncoderBlock(emb_size, drop_path=drop_path_rates[i])
+            for i in range(depth)
+        ])
 
 class ClassificationHead(nn.Module):
-    def __init__(self, emb_size: int, n_classes: int, seq_len: int):
+    # 移除 seq_len 参数，因为输入会被 GAP 压缩
+    def __init__(self, emb_size: int, n_classes: int):
         super().__init__()
         self.fc = nn.Sequential(
-            nn.Linear(seq_len * emb_size, 32),
+            # 直接接收 emb_size，例如扩容后的 40 维
+            nn.Linear(emb_size, 32),
             nn.ELU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2), # 维持高 Dropout
             nn.Linear(32, n_classes),
         )
+        
     def forward(self, x: Tensor):
-        feat = x.contiguous().view(x.size(0), -1)
+        # x 的输入形状: (Batch, seq_len=112, emb_size=40)
+        
+        # 核心：将 112 个时间步的特征融合为一个 40 维的全局时间不变特征
+        feat = x.mean(dim=1) 
+        
         return feat, self.fc(feat)
 
 class ViT(nn.Module):
-    def __init__(self, emb_size: int = 16, depth: int = 2,
+    def __init__(self, emb_size: int, depth: int,
                  n_classes: int = 2, n_channels: int = 30, seq_len: int = 11):
         super().__init__()
         self.patch_embedding = PatchEmbedding(emb_size, n_channels)
+        self.pos_embedding   = nn.Parameter(torch.randn(1, seq_len, emb_size) * 0.02)
         self.transformer     = TransformerEncoder(depth, emb_size)
-        self.cls_head        = ClassificationHead(emb_size, n_classes, seq_len)
+        self.cls_head        = ClassificationHead(emb_size, n_classes)
 
     def forward(self, x: Tensor):
         x = self.patch_embedding(x)
+        x = x + self.pos_embedding
         x = self.transformer(x)
         return self.cls_head(x)
 
 
 
 class ExGAN:
-    def __init__(self, data_dir: str, seq_len: int, depth: int, emb_size: int, pretrained_path: str = None):
+    def __init__(self, data_dir: str, seq_len: int, depth: int, emb_size: int):
         self.n_channels = 30
         self.n_times    = 250
         self.n_classes  = 2
@@ -154,40 +193,17 @@ class ExGAN:
         self.data_dir   = data_dir
         self.seq_len    = seq_len
         self.depth      = depth
-        self.emb_size   = emb_size
+        self.emb_size    = emb_size
 
-        self.criterion_cls = nn.CrossEntropyLoss().cuda()
+        self.criterion_cls = nn.CrossEntropyLoss(label_smoothing=0.1).cuda()
 
-        # 1. 初始化纯净的原始模型 (放在 CPU/单卡 内存中)
         self.model = ViT(
             emb_size=self.emb_size, depth=self.depth, n_classes=self.n_classes,
             n_channels=self.n_channels, seq_len=seq_len
-        )
-
-        # 2. 加载预训练参数逻辑
-        if pretrained_path is not None and os.path.exists(pretrained_path):
-            print(f"[Info] 发现预训练权重，正在加载: {pretrained_path}")
-            state_dict = torch.load(pretrained_path, map_location='cpu')
-            
-            # 兼容性处理：自动剥离保存时由 DataParallel 引入的 'module.' 前缀
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                name = k[7:] if k.startswith('module.') else k
-                new_state_dict[name] = v
-                
-            # strict=False 允许加载时忽略部分不匹配的网络层 (如后续修改了分类头)
-            # 如果你的网络结构完全没变，建议保持 strict=True
-            missing_keys, unexpected_keys = self.model.load_state_dict(new_state_dict, strict=True)
-            if missing_keys:
-                print(f"[Warning] 缺少以下层的权重: {missing_keys}")
-            if unexpected_keys:
-                print(f"[Warning] 预训练模型中包含多余的层: {unexpected_keys}")
-            print("[Info] 预训练权重加载成功！")
-
-        # 3. 将加载好权重的模型包裹进 DataParallel 并推入 GPU
+        ).cuda()
         self.model = nn.DataParallel(
-            self.model.cuda(), device_ids=list(range(len(gpus)))
-        )
+            self.model, device_ids=list(range(len(gpus)))
+        ).cuda()
 
     @staticmethod
     def get_seq_len(n_channels: int = 30, n_times: int = 250,
@@ -197,6 +213,20 @@ class ExGAN:
         with torch.no_grad():
             out = pe(dummy)
         return out.shape[1]
+
+    @staticmethod
+    def augment(x: Tensor) -> Tensor:
+        """EEG 数据增强: 高斯噪声 + 随机时间偏移 + 通道丢弃 (仅训练时调用)"""
+        # 1. 高斯噪声 (σ=0.02)
+        x = x + torch.randn_like(x) * 0.02
+        # 2. 随机时间偏移 (±25 采样点, 即 ±10% 窗口)
+        shift = torch.randint(-25, 25, (1,), device=x.device).item()
+        x = torch.roll(x, shift, dims=-1)
+        # 3. 30% 概率触发通道丢弃 (丢弃约 10% 通道)
+        if torch.rand(1, device=x.device).item() < 0.3:
+            mask = (torch.rand(x.size(0), 1, x.size(2), 1, device=x.device) > 0.1).float()
+            x = x * mask
+        return x
 
     # ── 新增：固定的 80/20 数据切分 (弃用多折) ──────────────────────────────
     def _get_train_test_data(self, sid: int):
@@ -229,8 +259,9 @@ class ExGAN:
         train_data,  train_label = all_data[train_idx], all_label[train_idx]
         test_data,   test_label  = all_data[test_idx],  all_label[test_idx]
 
-        # 用训练集统计量标准化 (按通道维度标准化更优，这里保持与之前一致的全量标准化)
-        mu, std    = train_data.mean(), train_data.std() + 1e-8
+        # 按通道标准化 (每通道独立均值和标准差)
+        mu    = train_data.mean(axis=(0, 2), keepdims=True)
+        std   = train_data.std(axis=(0, 2), keepdims=True) + 1e-8
         train_data = (train_data - mu) / std
         test_data  = (test_data  - mu) / std
 
@@ -283,7 +314,7 @@ class ExGAN:
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader   = torch.utils.data.DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
 
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2), weight_decay=1e-4) # 增加了一点 L2 正则化
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2), weight_decay=5e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
         best_val_acc = 0.0
@@ -299,11 +330,13 @@ class ExGAN:
             
             for imgs, labels in train_loader:
                 imgs, labels = imgs.cuda(), labels.cuda()
+                imgs = ExGAN.augment(imgs)
                 _, outputs   = self.model(imgs)
                 loss         = self.criterion_cls(outputs, labels)
-                
+
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
                 
                 train_loss    += loss.item() * len(imgs)
@@ -374,10 +407,12 @@ class ExGAN:
             self.model.train()
             for imgs, labels in loader:
                 imgs, labels = imgs.cuda(), labels.cuda()
+                imgs = ExGAN.augment(imgs)
                 _, outputs   = self.model(imgs)
                 loss         = self.criterion_cls(outputs, labels)
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
             scheduler.step()
 
@@ -405,17 +440,13 @@ def read_data(data_dir: str):
 
 def main():
     DATA_DIR = "./EEG-Conformer/data/processed_normal/"
-    CLUSTER_SAVE_DIR = "./EEG-Conformer/cluster_params/"
-    PARAM_DIR = "./EEG-Conformer/last_params/D2_H4_S24_best1.pth"
-    emb_size = 24
+    SAVE_DIR = "./EEG-Conformer/last_params/"
+    emb_size = 40
     depth   = 2
-    n_clusters = 4
-    os.makedirs(CLUSTER_SAVE_DIR, exist_ok=True)
     
     # 自动扫描受试者列表
     subject_ids = read_data(DATA_DIR)
     n_subjects = len(subject_ids)
-    cluster_subjects = cluster_subjects_by_baseline(DATA_DIR, subject_ids, n_clusters=n_clusters,show_plot=True)
     
     if n_subjects == 0:
         print(f"未在 {DATA_DIR} 找到数据，请检查路径。")
@@ -423,33 +454,22 @@ def main():
         
     print(f"找到 {n_subjects} 个受试者: {subject_ids}")
 
-    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=16)
+    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=emb_size)
     print(f"[Info] 动态推理 seq_len = {seq_len}")
-    '''
+
     starttime = datetime.datetime.now()
 
-    for cluster_id, cluster_sids in cluster_subjects.items():
-        print(f"\n" + "="*50)
-        print(f"开始训练 簇 {cluster_id} 的专属专家模型 (包含 {len(cluster_sids)} 个受试者)")
-        print("="*50)
-        
-        # 重新实例化模型，确保每个专家模型的权重是独立初始化的
-        # (如果想在 Global 模型基础上微调，可在此处额外加载 Global 预训练权重)
-        trainer = ExGAN(data_dir=DATA_DIR, seq_len=seq_len, depth=depth, emb_size=emb_size, pretrained_path=PARAM_DIR)
-        
-        # 仅传入当前簇的受试者 ID 列表进行训练
-        best_weights_path = trainer.pretrain_once(
-            subject_ids=cluster_sids, 
-            save_dir=CLUSTER_SAVE_DIR,
-            n_epochs=90,       
-            batch_size=128,
-            patience=30        
-        )
-        print(f"簇 {cluster_id} 专属模型训练完成。")
+    global_trainer = ExGAN(data_dir=DATA_DIR, seq_len=seq_len, depth=depth, emb_size=emb_size)
+    
+    # 提取并保存在内存中的预训练字典
+    best_weights_path = global_trainer.pretrain_once(
+        subject_ids=subject_ids, 
+        save_dir=SAVE_DIR,
+        n_epochs=150,       
+        batch_size=128,
+        patience=30        
+    )
 
-    elapsed = datetime.datetime.now() - starttime
-    print(f"\n所有 {n_clusters} 个簇的专家模型已全部训练完毕，总耗时: {elapsed}")
-    '''
 
 
 if __name__ == "__main__":
