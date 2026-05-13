@@ -37,27 +37,25 @@ def denoise_signals(all_data):
 
 '''emb_size=16,depth=1修改需要从EXGAN中的参数中修改'''
 class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size: int = 24, n_channels: int = 30):
+    def __init__(self, emb_size: int = 40, n_channels: int = 30):
         super().__init__()
         self.shallownet = nn.Sequential(
-            # 1. 时间维度卷积 (捕捉时域局部特征)
-            nn.Conv2d(1, 64, (1, 25), stride=(1, 1)),
+
+            nn.Conv2d(1, 64, (1, 15), stride=(1, 1), padding=(0, 7)),
             nn.ELU(),
 
-            # 2. 空间维度卷积 (融合 30 个电极通道)
+
             nn.Conv2d(64, 64, (n_channels, 1), stride=(1, 1)),
-            nn.GroupNorm(8, 64),
+            nn.BatchNorm2d(64), # 建议换回 BatchNorm，空间融合后更稳定
             nn.ELU(),
 
-            # 3. 额外时域精炼 (在空间融合后再做一次局部时序建模)
-            nn.Conv2d(64, 64, (1, 5), stride=(1, 1), padding=(0, 2)),
-            nn.GroupNorm(8, 64),
-            nn.ELU(),
+            # 3. 【核心细度修改】：中度池化
+            # 核大小 25 (代表 0.1 秒的平滑窗口)
+            # 步长 12 (代表 0.05 秒的滑动步伐)
+            # 250 个点经过计算后，序列长度会变成约 19 个 Token
+            nn.AvgPool2d((1, 25), stride=(1, 12)), 
 
-            # 4. 平滑池化降维
-            nn.AvgPool2d((1, 4), stride=(1, 2)),
-
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
         )
         self.projection = nn.Sequential(
             nn.Conv2d(64, emb_size, (1, 1), stride=(1, 1)),
