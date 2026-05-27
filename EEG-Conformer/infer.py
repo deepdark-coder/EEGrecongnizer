@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 # 【关键】从你之前的训练脚本中导入 ViT 模型结构
 # 假设你的训练脚本命名为 conformer_train.py，请根据实际文件名修改
-from comformer_raw import ViT, ExGAN 
+from conformer import ViT, ExGAN 
 
 def load_and_preprocess_data(data_path):
     """
@@ -44,7 +44,7 @@ def plot_results(y_true, y_pred, y_prob, save_dir):
 
 def main():
     # ================= 参数配置区 =================
-    MODEL_WEIGHTS_PATH = './EEG-Conformer/last_params/global_pretrain_last_e60.pth'
+    MODEL_WEIGHTS_PATH = './EEG-Conformer/last_params/D2_H4_S40_best1.pth'
     TEST_DATA_DIR = './EEG-Conformer/data/processed_normal/'
     # ==============================================
 

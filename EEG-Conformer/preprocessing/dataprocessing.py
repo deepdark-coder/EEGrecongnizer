@@ -4,8 +4,8 @@ import os
 import re
 
 def process_task_data():
-    raw_data_dir = './EEG-Conformer/data/normal/'
-    save_dir = './EEG-Conformer/data/processed_normal/'
+    raw_data_dir = './EEG-Conformer/data/depressive/'
+    save_dir = './EEG-Conformer/data/processed_depressive/'
     os.makedirs(save_dir, exist_ok=True)
     
     # 获取所有 .mat 文件
