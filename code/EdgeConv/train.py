@@ -34,9 +34,9 @@ from spatial_prior import get_spatial_dist
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', type=str, required=True)
+    p.add_argument('--data_dir', type=str,default="./data/code/normal_processed")
     p.add_argument('--extra_data_dir', type=str, nargs='*', default=[])
-    p.add_argument('--gpu', type=str, default='0')
+    p.add_argument('--gpu', type=str, default='1')
     p.add_argument('--window_size', type=int, default=40)
     p.add_argument('--stride', type=int, default=1)
     p.add_argument('--k_neighbors', type=int, default=20, help='k nearest neighbors for EdgeConv')
@@ -71,6 +71,7 @@ def parse_args():
     p.add_argument('--start_fold', type=int, default=1)
     p.add_argument('--end_fold', type=int, default=999)
     p.add_argument('--output_dir', type=str, default='./results')
+    p.add_argument('--save_path', default="./params", help='save best model weights')
     return p.parse_args()
 
 
@@ -395,6 +396,10 @@ def main():
                 break
 
         model.load_state_dict(best_state)
+        os.makedirs(args.save_path, exist_ok=True)
+        weight_save_path = os.path.join(args.save_path, 'edgeconv_best.pth')
+        
+        torch.save(best_state, weight_save_path)
         if args.use_adabn:
             adapt_bn(model, test_loader, device)
 

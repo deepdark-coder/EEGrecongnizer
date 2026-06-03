@@ -79,8 +79,8 @@ def process_subject(mat_path, output_dir):
 
 
 def main():
-    input_dir = Path(r'D:\Emotion\4_dataset\4_dataset\traindata\yiyuzheng')
-    output_dir = Path(r'D:\Emotion\4_dataset_Processed\4_dataset_Processed\train\depression')
+    input_dir = Path("./EEG-Conformer/data/normal/")
+    output_dir = Path("./data/code/normal_processed/")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     mat_files = sorted(input_dir.glob('*.mat'))

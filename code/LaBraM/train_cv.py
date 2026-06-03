@@ -52,7 +52,7 @@ def run_fold(fold_idx, data_dir, train_files, test_files, extra_dirs, extra_file
     model = create_model(args.model, pretrained=False, num_classes=2, drop_rate=0.0, drop_path_rate=0.1, attn_drop_rate=0.0, use_mean_pooling=True, init_scale=0.001, use_rel_pos_bias=True, use_abs_pos_emb=True, init_values=0.1, qkv_bias=True)
     patch_size = model.patch_size
 
-    ckpt = torch.load(args.finetune, map_location='cpu', weights_only=False)
+    ckpt = torch.load(args.finetune, map_location='cpu')
     ckpt_m = None
     for mk in 'model|module'.split('|'):
         if mk in ckpt: ckpt_m = ckpt[mk]; break
@@ -95,7 +95,7 @@ def run_fold(fold_idx, data_dir, train_files, test_files, extra_dirs, extra_file
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', default='./de_data')
+    p.add_argument('--data_dir', default='./data/code/normal_processed')
     p.add_argument('--extra_data_dir', nargs='*', default=[], help='extra training-only dirs (e.g. depression)')
     p.add_argument('--output_dir', default='./output_de_cv')
     p.add_argument('--device', default='cuda')
@@ -106,7 +106,7 @@ def main():
     p.add_argument('--start_fold', default=0, type=int)
     p.add_argument('--end_fold', default=4, type=int)
     p.add_argument('--model', default='labram_base_patch200_200')
-    p.add_argument('--finetune', default='./checkpoints/labram-base.pth')
+    p.add_argument('--finetune', default='./code/LaBraM/checkpoints/labram-base.pth')
     p.add_argument('--num_workers', default=4, type=int)
     p.add_argument('--world_size', default=1, type=int); p.add_argument('--local_rank', default=-1, type=int)
     p.add_argument('--dist_url', default='env://'); p.add_argument('--dist_on_itp', action='store_true')
