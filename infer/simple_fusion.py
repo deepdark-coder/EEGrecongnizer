@@ -48,12 +48,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Simple late fusion for EdgeConv, LaBraM and EEG-Conformer."
     )
-    parser.add_argument("--de_data_dir", type=str, default=str(ROOT / "processed_normal"))
-    parser.add_argument("--mat_data_dir", type=str, default=str(ROOT / "EEG-Conformer" / "data" / "processed_normal"))
+    parser.add_argument("--de_data_dir", type=str, default=str(ROOT / "data" / "code" / "processed_testset"))
+    parser.add_argument("--mat_data_dir", type=str, default=str(ROOT / "EEG-Conformer" / "data" / "processed_testset"))
 
-    parser.add_argument("--edge_ckpt", type=str, default="")
-    parser.add_argument("--labram_ckpt", type=str, default="")
-    parser.add_argument("--eeg_ckpt", type=str, default=str(ROOT / "EEG-Conformer" / "last_params" / "better_D2_H4_S40_best1.pth"))
+    parser.add_argument("--edge_ckpt", type=str, default=str(ROOT / "params" / "edgeconv_best.pth"))
+    parser.add_argument("--labram_ckpt", type=str, default=str(ROOT / "params" / "labram_best.pth"))
+    parser.add_argument("--eeg_ckpt", type=str, default=str(ROOT / "EEG-Conformer" / "last_params" / "finetuned_best.pth"))
 
     parser.add_argument("--edge_weight", type=float, default=1.0)
     parser.add_argument("--labram_weight", type=float, default=1.0)
@@ -65,8 +65,8 @@ def parse_args():
     parser.add_argument("--labram_stride", type=int, default=5)
 
     parser.add_argument("--edge_k", type=int, default=20)
-    parser.add_argument("--edge_use_asymmetry", action="store_true")
-    parser.add_argument("--edge_use_band_se", action="store_true")
+    parser.add_argument("--edge_use_asymmetry",default=False, action="store_true")
+    parser.add_argument("--edge_use_band_se",default=False, action="store_true")
 
     parser.add_argument("--eeg_emb_size", type=int, default=40)
     parser.add_argument("--eeg_depth", type=int, default=2)

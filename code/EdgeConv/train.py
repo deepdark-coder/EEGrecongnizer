@@ -400,6 +400,7 @@ def main():
         weight_save_path = os.path.join(args.save_path, 'edgeconv_best.pth')
         
         torch.save(best_state, weight_save_path)
+        print(f"Best model weights saved to:{weight_save_path}")
         if args.use_adabn:
             adapt_bn(model, test_loader, device)
 

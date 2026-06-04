@@ -423,7 +423,7 @@ class ExGAN:
 
         best_val_acc = 0.0
         patience_counter = 0
-        best_save_path = os.path.join(save_dir, f'test_D{self.depth}_H4_S{self.emb_size}_best1.pth')
+        best_save_path = os.path.join(save_dir, f'conformer_best1.pth')
 
         print(f"  ▶ 全局训练集大小: {len(all_train_data)} | 全局验证集大小: {len(all_val_data)}")
 
@@ -517,7 +517,7 @@ class ExGAN:
         ema = EMA(self.model, decay=0.999)
 
         best_acc = 0.0
-        best_save_path = os.path.join(save_dir, f'{sid}_finetuned_best.pth')
+        best_save_path = os.path.join(save_dir, f'finetuned_best.pth')
 
         for epoch in range(n_epochs):
             self.model.train()
@@ -603,7 +603,7 @@ def main():
         save_dir=SAVE_DIR,
         n_epochs=300,
         batch_size=128,
-        patience=60
+        patience=120
     )
 
     # ── 阶段 2: 逐被试微调 + TTA 评估 ──
