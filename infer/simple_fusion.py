@@ -53,7 +53,7 @@ def parse_args():
 
     parser.add_argument("--edge_ckpt", type=str, default=str(ROOT / "params" / "edgeconv_best.pth"))
     parser.add_argument("--labram_ckpt", type=str, default=str(ROOT / "params" / "labram_best.pth"))
-    parser.add_argument("--eeg_ckpt", type=str, default=str(ROOT / "EEG-Conformer" / "last_params" / "finetuned_best.pth"))
+    parser.add_argument("--eeg_ckpt", type=str, default=str(ROOT / "EEG-Conformer" / "last_params" / "conformer_D2_H4_S24_best1.pth"))
 
     parser.add_argument("--edge_weight", type=float, default=1.0)
     parser.add_argument("--labram_weight", type=float, default=1.0)
@@ -68,7 +68,7 @@ def parse_args():
     parser.add_argument("--edge_use_asymmetry",default=False, action="store_true")
     parser.add_argument("--edge_use_band_se",default=False, action="store_true")
 
-    parser.add_argument("--eeg_emb_size", type=int, default=40)
+    parser.add_argument("--eeg_emb_size", type=int, default=24)
     parser.add_argument("--eeg_depth", type=int, default=2)
 
     parser.add_argument("--batch_size", type=int, default=128)

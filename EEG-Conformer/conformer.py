@@ -1,94 +1,98 @@
-import os, random, datetime, time, glob, copy
-import scipy.io
+import argparse
+import datetime
+import glob
+import os
+
 import numpy as np
+import scipy.io
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
-from torch.backends import cudnn
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from pre_denoise import load_and_denoise_data
+from sklearn.model_selection import KFold
+from torch import Tensor
+from torch.backends import cudnn
 
-cudnn.benchmark     = False
+
+cudnn.benchmark = False
 cudnn.deterministic = True
 
+gpus = [0]
 
-gpus = [1]
-os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
-os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpus))
 
 def denoise_signals(all_data):
-        """
-        物理去噪核心函数：幅值截断 + CAR 空间滤波
-        输入形状: (Trials, Channels, Times)
-        """
-        # 1. 幅值截断 (剔除极端的眼电/肌电突刺)
-        std_val = np.std(all_data)
-        threshold = 3 * std_val
-        all_data = np.clip(all_data, -threshold, threshold)
+    std_val = np.std(all_data)
+    threshold = 3 * std_val
+    all_data = np.clip(all_data, -threshold, threshold)
+    common_mode_noise = np.mean(all_data, axis=1, keepdims=True)
+    return all_data - common_mode_noise
 
-        # 2. CAR 空间滤波 (共模平均参考)
-        # 减去所有通道在同一时刻的均值
-        common_mode_noise = np.mean(all_data, axis=1, keepdims=True)
-        all_data = all_data - common_mode_noise
-        
-        return all_data 
 
-'''emb_size=16,depth=1修改需要从EXGAN中的参数中修改'''
+def pick_group_count(num_channels: int, max_groups: int = 8) -> int:
+    for groups in range(min(max_groups, num_channels), 0, -1):
+        if num_channels % groups == 0:
+            return groups
+    return 1
+
+
 class PatchEmbedding(nn.Module):
     def __init__(self, emb_size: int = 40, n_channels: int = 30):
         super().__init__()
+        feat_channels = 64
+        feat_groups = pick_group_count(feat_channels)
         self.shallownet = nn.Sequential(
-
-            nn.Conv2d(1, 64, (1, 15), stride=(1, 1), padding=(0, 7)),
+            nn.Conv2d(1, feat_channels, (1, 15), stride=(1, 1), padding=(0, 7), bias=False),
+            nn.GroupNorm(feat_groups, feat_channels),
             nn.ELU(),
-
-
-            nn.Conv2d(64, 64, (n_channels, 1), stride=(1, 1)),
-            nn.BatchNorm2d(64), # 建议换回 BatchNorm，空间融合后更稳定
+            nn.Conv2d(
+                feat_channels,
+                feat_channels,
+                (1, 7),
+                stride=(1, 1),
+                padding=(0, 3),
+                groups=feat_channels,
+                bias=False,
+            ),
+            nn.Conv2d(feat_channels, feat_channels, (n_channels, 1), stride=(1, 1), bias=False),
+            nn.GroupNorm(feat_groups, feat_channels),
             nn.ELU(),
-
-            # 3. 【核心细度修改】：中度池化
-            # 核大小 25 (代表 0.1 秒的平滑窗口)
-            # 步长 12 (代表 0.05 秒的滑动步伐)
-            # 250 个点经过计算后，序列长度会变成约 19 个 Token
-            nn.AvgPool2d((1, 25), stride=(1, 12)), 
-
+            nn.AvgPool2d((1, 15), stride=(1, 8)),
             nn.Dropout(0.3),
         )
         self.projection = nn.Sequential(
-            nn.Conv2d(64, emb_size, (1, 1), stride=(1, 1)),
-            Rearrange('b e h w -> b (h w) e'),
+            nn.Conv2d(feat_channels, emb_size, (1, 1), stride=(1, 1)),
+            Rearrange("b e h w -> b (h w) e"),
         )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.projection(self.shallownet(x))
 
+
 class MultiHeadAttention(nn.Module):
     def __init__(self, emb_size: int, num_heads: int, dropout: float):
         super().__init__()
-        self.emb_size   = emb_size
-        self.num_heads  = num_heads
-        self.keys       = nn.Linear(emb_size, emb_size)
-        self.queries    = nn.Linear(emb_size, emb_size)
-        self.values     = nn.Linear(emb_size, emb_size)
-        self.att_drop   = nn.Dropout(dropout)
+        self.emb_size = emb_size
+        self.num_heads = num_heads
+        self.keys = nn.Linear(emb_size, emb_size)
+        self.queries = nn.Linear(emb_size, emb_size)
+        self.values = nn.Linear(emb_size, emb_size)
+        self.att_drop = nn.Dropout(dropout)
         self.projection = nn.Linear(emb_size, emb_size)
 
     def forward(self, x: Tensor, mask: Tensor = None) -> Tensor:
         q = rearrange(self.queries(x), "b n (h d) -> b h n d", h=self.num_heads)
-        k = rearrange(self.keys(x),    "b n (h d) -> b h n d", h=self.num_heads)
-        v = rearrange(self.values(x),  "b n (h d) -> b h n d", h=self.num_heads)
-        energy = torch.einsum('bhqd, bhkd -> bhqk', q, k)
+        k = rearrange(self.keys(x), "b n (h d) -> b h n d", h=self.num_heads)
+        v = rearrange(self.values(x), "b n (h d) -> b h n d", h=self.num_heads)
+        energy = torch.einsum("bhqd, bhkd -> bhqk", q, k)
         if mask is not None:
             energy = energy.masked_fill_(~mask, torch.finfo(torch.float32).min)
         att = self.att_drop(F.softmax(energy / (self.emb_size / self.num_heads) ** 0.5, dim=-1))
-        out = torch.einsum('bhal, bhlv -> bhav', att, v)
+        out = torch.einsum("bhal, bhlv -> bhav", att, v)
         return self.projection(rearrange(out, "b h n d -> b n (h d)"))
 
+
 class DropPath(nn.Module):
-    """Stochastic Depth — 训练时随机丢弃整条残差分支，防止过拟合。"""
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
         self.drop_prob = drop_prob
@@ -104,7 +108,6 @@ class DropPath(nn.Module):
 
 
 class EMA:
-    """指数移动平均 — 验证时使用参数滑动平均, 通常带来 0.5-1% 提升"""
     def __init__(self, model, decay: float = 0.999):
         self.model = model
         self.decay = decay
@@ -117,8 +120,7 @@ class EMA:
     def update(self):
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.shadow[name].copy_(
-                    self.decay * self.shadow[name] + (1 - self.decay) * param.data)
+                self.shadow[name].copy_(self.decay * self.shadow[name] + (1 - self.decay) * param.data)
 
     def apply_shadow(self):
         for name, param in self.model.named_parameters():
@@ -136,8 +138,10 @@ class ResidualAdd(nn.Module):
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
+
     def forward(self, x: Tensor, **kwargs) -> Tensor:
         return x + self.fn(x, **kwargs)
+
 
 class FeedForwardBlock(nn.Sequential):
     def __init__(self, emb_size: int, expansion: int, drop_p: float):
@@ -148,64 +152,77 @@ class FeedForwardBlock(nn.Sequential):
             nn.Linear(expansion * emb_size, emb_size),
         )
 
+
 class ConvolutionModule(nn.Module):
-    """Conformer 卷积模块: 逐点卷积 → GLU → 深度可分离卷积 → 逐点卷积"""
     def __init__(self, emb_size: int, kernel_size: int = 31, dropout: float = 0.1):
         super().__init__()
         self.layer_norm = nn.LayerNorm(emb_size)
         self.pointwise_conv1 = nn.Conv1d(emb_size, emb_size * 2, 1)
         self.glu = nn.GLU(dim=1)
         self.depthwise_conv = nn.Conv1d(
-            emb_size, emb_size, kernel_size,
-            padding=kernel_size // 2, groups=emb_size
+            emb_size,
+            emb_size,
+            kernel_size,
+            padding=kernel_size // 2,
+            groups=emb_size,
         )
-        self.batch_norm = nn.BatchNorm1d(emb_size)
+        self.channel_norm = nn.GroupNorm(pick_group_count(emb_size), emb_size)
         self.swish = nn.SiLU()
         self.pointwise_conv2 = nn.Conv1d(emb_size, emb_size, 1)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: (B, T, D)
         residual = x
         x = self.layer_norm(x)
-        x = x.transpose(1, 2)                      # (B, D, T)
+        x = x.transpose(1, 2)
         x = self.pointwise_conv1(x)
         x = self.glu(x)
         x = self.depthwise_conv(x)
-        x = self.batch_norm(x)
+        x = self.channel_norm(x)
         x = self.swish(x)
         x = self.pointwise_conv2(x)
         x = self.dropout(x)
-        x = x.transpose(1, 2)                      # (B, T, D)
+        x = x.transpose(1, 2)
         return residual + x
 
 
 class ConformerBlock(nn.Module):
-    """Conformer Block: FFN/2 → MHSA → Conv → FFN/2 → LayerNorm"""
-    def __init__(self, emb_size: int, num_heads: int = 4,
-                 drop_p: float = 0.1, forward_expansion: int = 4,
-                 forward_drop_p: float = 0.1, drop_path: float = 0.0,
-                 conv_kernel: int = 31):
+    def __init__(
+        self,
+        emb_size: int,
+        num_heads: int = 4,
+        drop_p: float = 0.1,
+        forward_expansion: int = 4,
+        forward_drop_p: float = 0.1,
+        drop_path: float = 0.0,
+        conv_kernel: int = 31,
+    ):
         super().__init__()
-        self.ffn1 = ResidualAdd(nn.Sequential(
-            nn.LayerNorm(emb_size),
-            FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
-            nn.Dropout(drop_p),
-            DropPath(drop_path),
-        ))
-        self.mhsa = ResidualAdd(nn.Sequential(
-            nn.LayerNorm(emb_size),
-            MultiHeadAttention(emb_size, num_heads, drop_p),
-            nn.Dropout(drop_p),
-            DropPath(drop_path),
-        ))
+        self.ffn1 = ResidualAdd(
+            nn.Sequential(
+                nn.LayerNorm(emb_size),
+                FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
+                nn.Dropout(drop_p),
+                DropPath(drop_path),
+            )
+        )
+        self.mhsa = ResidualAdd(
+            nn.Sequential(
+                nn.LayerNorm(emb_size),
+                MultiHeadAttention(emb_size, num_heads, drop_p),
+                nn.Dropout(drop_p),
+                DropPath(drop_path),
+            )
+        )
         self.conv = ConvolutionModule(emb_size, conv_kernel, drop_p)
-        self.ffn2 = ResidualAdd(nn.Sequential(
-            nn.LayerNorm(emb_size),
-            FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
-            nn.Dropout(drop_p),
-            DropPath(drop_path),
-        ))
+        self.ffn2 = ResidualAdd(
+            nn.Sequential(
+                nn.LayerNorm(emb_size),
+                FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
+                nn.Dropout(drop_p),
+                DropPath(drop_path),
+            )
+        )
         self.final_norm = nn.LayerNorm(emb_size)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -220,96 +237,156 @@ class ConformerBlock(nn.Module):
 class ConformerEncoder(nn.Sequential):
     def __init__(self, depth: int, emb_size: int, drop_path_max: float = 0.2):
         drop_path_rates = [drop_path_max * i / (depth - 1) for i in range(depth)] if depth > 1 else [0.0]
-        super().__init__(*[
-            ConformerBlock(emb_size, drop_path=drop_path_rates[i])
-            for i in range(depth)
-        ])
+        super().__init__(*[ConformerBlock(emb_size, drop_path=drop_path_rates[i]) for i in range(depth)])
+
 
 class ClassificationHead(nn.Module):
-    # 移除 seq_len 参数，因为输入会被 GAP 压缩
     def __init__(self, emb_size: int, n_classes: int):
         super().__init__()
-        self.fc = nn.Sequential(
-            # 直接接收 emb_size，例如扩容后的 40 维
-            nn.Linear(emb_size, 32),
-            nn.ELU(),
-            nn.Dropout(0.2), # 维持高 Dropout
-            nn.Linear(32, n_classes),
+        hidden_size = max(64, emb_size)
+        self.token_attention = nn.Sequential(
+            nn.LayerNorm(emb_size),
+            nn.Linear(emb_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size, 1),
         )
-        
+        self.fc = nn.Sequential(
+            nn.Linear(emb_size * 2, hidden_size),
+            nn.ELU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size, n_classes),
+        )
+
     def forward(self, x: Tensor):
-        # x 的输入形状: (Batch, seq_len=112, emb_size=40)
-        
-        # 核心：将 112 个时间步的特征融合为一个 40 维的全局时间不变特征
-        feat = x.mean(dim=1) 
-        
+        token_scores = self.token_attention(x)
+        token_weights = torch.softmax(token_scores, dim=1)
+        attn_feat = (token_weights * x).sum(dim=1)
+        mean_feat = x.mean(dim=1)
+        feat = torch.cat([attn_feat, mean_feat], dim=-1)
         return feat, self.fc(feat)
 
+
 class ViT(nn.Module):
-    def __init__(self, emb_size: int, depth: int,
-                 n_classes: int = 2, n_channels: int = 30, seq_len: int = 11):
+    def __init__(self, emb_size: int, depth: int, n_classes: int = 2, n_channels: int = 30, seq_len: int = 11):
         super().__init__()
         self.patch_embedding = PatchEmbedding(emb_size, n_channels)
-        self.pos_embedding   = nn.Parameter(torch.randn(1, seq_len, emb_size) * 0.02)
-        self.transformer     = ConformerEncoder(depth, emb_size)
-        self.cls_head        = ClassificationHead(emb_size, n_classes)
+        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, emb_size) * 0.02)
+        self.pos_drop = nn.Dropout(0.1)
+        self.transformer = ConformerEncoder(depth, emb_size)
+        self.cls_head = ClassificationHead(emb_size, n_classes)
 
     def forward(self, x: Tensor):
         x = self.patch_embedding(x)
-        x = x + self.pos_embedding
+        x = self.pos_drop(x + self.pos_embedding)
         x = self.transformer(x)
         return self.cls_head(x)
 
 
+def warmup_cosine_scheduler(optimizer, warmup_epochs: int, total_epochs: int):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return 0.5 * (1 + np.cos(np.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
 
 class ExGAN:
-    def __init__(self, data_dir: str, seq_len: int, depth: int, emb_size: int):
+    def __init__(
+        self,
+        data_dir: str,
+        seq_len: int,
+        depth: int,
+        emb_size: int,
+        device: torch.device,
+        lr: float = 2e-4,
+        weight_decay: float = 5e-4,
+        model_seed: int = 42,
+        use_denoise: bool = True,
+        amp_enabled: bool = True,
+        aug_noise_std: float = 0.02,
+        aug_shift: int = 25,
+        channel_mask_prob: float = 0.3,
+        channel_drop_prob: float = 0.1,
+        mixup_prob: float = 0.5,
+        mixup_alpha: float = 0.1,
+        label_smoothing: float = 0.05,
+        tta_shift: int = 8,
+    ):
         self.n_channels = 30
-        self.n_times    = 250
-        self.n_classes  = 2
-        self.lr         = 0.0002
-        self.b1, self.b2 = 0.5, 0.999
-        self.data_dir   = data_dir
-        self.seq_len    = seq_len
-        self.depth      = depth
-        self.emb_size    = emb_size
+        self.n_times = 250
+        self.n_classes = 2
+        self.lr = lr
+        self.b1, self.b2 = 0.9, 0.999
+        self.weight_decay = weight_decay
+        self.data_dir = data_dir
+        self.seq_len = seq_len
+        self.depth = depth
+        self.emb_size = emb_size
+        self.device = device
+        self.model_seed = model_seed
+        self.use_denoise = use_denoise
+        self.amp_enabled = amp_enabled and device.type == "cuda"
+        self.aug_noise_std = aug_noise_std
+        self.aug_shift = aug_shift
+        self.channel_mask_prob = channel_mask_prob
+        self.channel_drop_prob = channel_drop_prob
+        self.mixup_prob = mixup_prob
+        self.mixup_alpha = mixup_alpha
+        self.label_smoothing = label_smoothing
+        self.tta_shift = tta_shift
+        self.subject_cache = {}
+        self.model_selection_epsilon = 1e-4
 
-        self.criterion_cls = nn.CrossEntropyLoss(label_smoothing=0.1).cuda()
-
-        self.model = ViT(
-            emb_size=self.emb_size, depth=self.depth, n_classes=self.n_classes,
-            n_channels=self.n_channels, seq_len=seq_len
-        ).cuda()
-        self.model = nn.DataParallel(
-            self.model, device_ids=list(range(len(gpus)))
-        ).cuda()
+        self.criterion_train = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing).to(self.device)
+        self.criterion_eval = nn.CrossEntropyLoss().to(self.device)
+        self.model = None
+        self._reset_model()
 
     @staticmethod
-    def get_seq_len(n_channels: int = 30, n_times: int = 250,
-                    emb_size: int = 16) -> int:
+    def get_seq_len(n_channels: int = 30, n_times: int = 250, emb_size: int = 16) -> int:
         dummy = torch.zeros(1, 1, n_channels, n_times)
-        pe    = PatchEmbedding(emb_size, n_channels)
+        pe = PatchEmbedding(emb_size, n_channels)
         with torch.no_grad():
             out = pe(dummy)
         return out.shape[1]
 
-    @staticmethod
-    def augment(x: Tensor) -> Tensor:
-        """EEG 数据增强: 高斯噪声 + 随机时间偏移 + 通道丢弃 (仅训练时调用)"""
-        # 1. 高斯噪声 (σ=0.02)
-        x = x + torch.randn_like(x) * 0.02
-        # 2. 随机时间偏移 (±25 采样点, 即 ±10% 窗口)
-        shift = torch.randint(-25, 25, (1,), device=x.device).item()
+    def augment(self, x: Tensor) -> Tensor:
+        x = x + torch.randn_like(x) * self.aug_noise_std
+        shift = torch.randint(-self.aug_shift, self.aug_shift + 1, (1,), device=x.device).item()
         x = torch.roll(x, shift, dims=-1)
-        # 3. 30% 概率触发通道丢弃 (丢弃约 10% 通道)
-        if torch.rand(1, device=x.device).item() < 0.3:
-            mask = (torch.rand(x.size(0), 1, x.size(2), 1, device=x.device) > 0.1).float()
+        if torch.rand(1, device=x.device).item() < self.channel_mask_prob:
+            mask = (torch.rand(x.size(0), 1, x.size(2), 1, device=x.device) > self.channel_drop_prob).float()
             x = x * mask
         return x
 
+    def eval_augment(self, x: Tensor, shift: int = 0) -> Tensor:
+        if shift:
+            x = torch.roll(x, shifts=shift, dims=-1)
+        return x
+
+    def get_tta_shifts(self, n_views: int):
+        if n_views <= 1 or self.tta_shift <= 0:
+            return [0] * max(1, n_views)
+        if n_views == 2:
+            return [0, self.tta_shift]
+
+        shifts = [0]
+        raw_shifts = np.linspace(-self.tta_shift, self.tta_shift, max(1, n_views - 1))
+        for shift in raw_shifts:
+            shift_value = int(round(float(shift)))
+            if shift_value == 0:
+                continue
+            shifts.append(shift_value)
+
+        while len(shifts) < n_views:
+            shifts.append(0)
+        return shifts[:n_views]
+
     @staticmethod
     def mixup(x: Tensor, y: Tensor, alpha: float = 0.2):
-        """Mixup 数据增强: 线性混合两个样本及其标签"""
         if alpha > 0:
             lam = np.random.beta(alpha, alpha)
         else:
@@ -318,318 +395,570 @@ class ExGAN:
         mixed_x = lam * x + (1 - lam) * x[index]
         return mixed_x, y, y[index], lam
 
+    @staticmethod
+    def _cpu_state_dict(model):
+        return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+    def _build_model(self):
+        model = ViT(
+            emb_size=self.emb_size,
+            depth=self.depth,
+            n_classes=self.n_classes,
+            n_channels=self.n_channels,
+            seq_len=self.seq_len,
+        ).to(self.device)
+        if self.device.type == "cuda" and len(gpus) > 1:
+            model = nn.DataParallel(model, device_ids=list(range(len(gpus)))).to(self.device)
+        return model
+
+    def _reset_model(self):
+        torch.manual_seed(self.model_seed)
+        np.random.seed(self.model_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.model_seed)
+        self.model = self._build_model()
+
     @torch.no_grad()
     def tta_evaluate(self, x: Tensor, n_views: int = 5) -> Tensor:
-        """测试时增强: 多次增强取平均 logits, 降低预测方差"""
         logits_sum = None
-        for _ in range(n_views):
-            x_aug = ExGAN.augment(x.clone())
-            _, out = self.model(x_aug)
-            if logits_sum is None:
-                logits_sum = out
-            else:
-                logits_sum += out
+        for shift in self.get_tta_shifts(n_views):
+            x_aug = self.eval_augment(x.clone(), shift=shift)
+            with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+                _, out = self.model(x_aug)
+            logits_sum = out if logits_sum is None else logits_sum + out
         return logits_sum / n_views
 
-    # ── 新增：固定的 80/20 数据切分 (弃用多折) ──────────────────────────────
-    def _get_train_test_data(self, sid: int):
-        """
-        单次划分：按被试固定的 seed，抽取 80% 作为训练集，20% 作为测试集。
-        """
-        # 注意：此处文件名需匹配你真实的数据命名规则
-        mat_file = os.path.join(self.data_dir, f'HC{sid}_1s.mat')
-        mat      = scipy.io.loadmat(mat_file)
-
-        all_data  = np.ascontiguousarray(mat['data'],            dtype=np.float32)
-        all_label = np.ascontiguousarray(mat['label'].flatten(), dtype=np.int64)
-
-        all_data = denoise_signals(all_data)#denoise processing
-
-        train_idx_list, test_idx_list = [], []
-        for cls in [0, 1]:
-            cls_idx   = np.where(all_label == cls)[0]
-            rng       = np.random.RandomState(sid)           # 固定seed
-            cls_idx   = cls_idx[rng.permutation(len(cls_idx))]
-            
-            # 80% 训练, 20% 测试
-            split_point = int(len(cls_idx) * 0.8)
-            train_idx_list.append(cls_idx[:split_point])
-            test_idx_list.append(cls_idx[split_point:])
-
-        train_idx = np.concatenate(train_idx_list)
-        test_idx  = np.concatenate(test_idx_list)
-
-        train_data,  train_label = all_data[train_idx], all_label[train_idx]
-        test_data,   test_label  = all_data[test_idx],  all_label[test_idx]
-
-        # 按通道标准化 (每通道独立均值和标准差)
-        mu    = train_data.mean(axis=(0, 2), keepdims=True)
-        std   = train_data.std(axis=(0, 2), keepdims=True) + 1e-8
-        train_data = (train_data - mu) / std
-        test_data  = (test_data  - mu) / std
-
-        # 增加 channel 维度 (N, 1, 30, 250)
-        train_data  = np.ascontiguousarray(train_data[:, np.newaxis], dtype=np.float32)
-        test_data   = np.ascontiguousarray(test_data[:,  np.newaxis], dtype=np.float32)
-        train_label = np.ascontiguousarray(train_label, dtype=np.int64)
-        test_label  = np.ascontiguousarray(test_label,  dtype=np.int64)
-
-        return train_data, train_label, test_data, test_label
-
-    def pretrain_once(self, subject_ids: list, save_dir: str, n_epochs: int = 40, batch_size: int = 128, patience: int = 10):
-        """
-        带全局验证和早停机制的预训练。
-        提取所有被试的 80% 作为训练集，20% 作为验证集。
-        仅保存验证集精度（Val Acc）最高时的权重。
-        """
-        print(f"\n[全局预训练] 正在加载 {len(subject_ids)} 个被试的数据并构建全局 Train / Val 集...")
-        all_train_data, all_train_label = [], []
-        all_val_data, all_val_label = [], []
-        
-        for sid in subject_ids:
-            tr_d, tr_l, val_d, val_l = self._get_train_test_data(sid)
-            all_train_data.append(tr_d)
-            all_train_label.append(tr_l)
-            all_val_data.append(val_d)
-            all_val_label.append(val_l)
-
-        # 拼接全局训练集和全局验证集
-        all_train_data  = np.concatenate(all_train_data,  axis=0)
-        all_train_label = np.concatenate(all_train_label, axis=0)
-        all_val_data    = np.concatenate(all_val_data,    axis=0)
-        all_val_label   = np.concatenate(all_val_label,   axis=0)
-
-        # 仅打乱训练集，验证集无需打乱
-        perm = np.random.permutation(len(all_train_data))
-        all_train_data  = all_train_data[perm]
-        all_train_label = all_train_label[perm]
-
-        # 构建双轨 DataLoader
-        train_dataset = torch.utils.data.TensorDataset(
-            torch.tensor(all_train_data,  dtype=torch.float32),
-            torch.tensor(all_train_label, dtype=torch.long)
-        )
-        val_dataset = torch.utils.data.TensorDataset(
-            torch.tensor(all_val_data,  dtype=torch.float32),
-            torch.tensor(all_val_label, dtype=torch.long)
-        )
-        
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader   = torch.utils.data.DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
-
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, betas=(self.b1, self.b2), weight_decay=5e-4)
-        scheduler = warmup_cosine_scheduler(optimizer, warmup_epochs=5, total_epochs=n_epochs)
-        ema = EMA(self.model, decay=0.999)
-
-        best_val_acc = 0.0
-        patience_counter = 0
-        best_save_path = os.path.join(save_dir, f'conformer_best1.pth')
-
-        print(f"  ▶ 全局训练集大小: {len(all_train_data)} | 全局验证集大小: {len(all_val_data)}")
-
-        for epoch in range(n_epochs):
-            # ================== 1. 训练阶段 ==================
-            self.model.train()
-            train_loss, train_correct = 0.0, 0
-
-            for imgs, labels in train_loader:
-                imgs, labels = imgs.cuda(), labels.cuda()
-                imgs = ExGAN.augment(imgs)
-                # 概率性 Mixup: 50% 批次做 mixup, 其余用干净标签
-                if torch.rand(1).item() < 0.5:
-                    imgs, labels_a, labels_b, lam = ExGAN.mixup(imgs, labels, alpha=0.1)
-                    _, outputs = self.model(imgs)
-                    loss = lam * self.criterion_cls(outputs, labels_a) + \
-                           (1 - lam) * self.criterion_cls(outputs, labels_b)
+    @torch.no_grad()
+    def batched_predict(self, x: Tensor, batch_size: int, n_tta: int = 1) -> Tensor:
+        logits_list = []
+        for start in range(0, len(x), batch_size):
+            end = min(start + batch_size, len(x))
+            batch = x[start:end]
+            try:
+                if n_tta and n_tta > 1:
+                    logits = self.tta_evaluate(batch, n_views=n_tta)
                 else:
-                    _, outputs = self.model(imgs)
-                    loss = self.criterion_cls(outputs, labels)
+                    with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+                        _, logits = self.model(batch)
+            except RuntimeError as exc:
+                if self.device.type != "cuda" or "cuDNN algorithm" not in str(exc):
+                    raise
+                # Retry once with cuDNN disabled for this batch when the current
+                # CUDA/cuDNN stack cannot find a valid deterministic algorithm.
+                with torch.backends.cudnn.flags(enabled=False):
+                    if n_tta and n_tta > 1:
+                        logits = self.tta_evaluate(batch, n_views=n_tta)
+                    else:
+                        with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+                            _, logits = self.model(batch)
+            logits_list.append(logits)
+        return torch.cat(logits_list, dim=0)
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-                ema.update()
+    def _load_subject_data(self, sid: int):
+        if sid in self.subject_cache:
+            return self.subject_cache[sid]
+        mat_file = os.path.join(self.data_dir, f"HC{sid}_1s.mat")
+        mat = scipy.io.loadmat(mat_file)
+        all_data = np.ascontiguousarray(mat["data"], dtype=np.float32)
+        all_label = np.ascontiguousarray(mat["label"].flatten(), dtype=np.int64)
+        if self.use_denoise:
+            all_data = denoise_signals(all_data)
+        self.subject_cache[sid] = (all_data, all_label)
+        return self.subject_cache[sid]
 
-                train_loss    += loss.item() * len(imgs)
-                train_correct += (outputs.argmax(1) == labels).sum().item()
+    @staticmethod
+    def _compute_normalization_stats(train_data):
+        mu = train_data.mean(axis=(0, 2), keepdims=True)
+        std = train_data.std(axis=(0, 2), keepdims=True) + 1e-8
+        return mu, std
 
-            scheduler.step()
-            avg_train_loss = train_loss / len(all_train_data)
-            avg_train_acc  = train_correct / len(all_train_data)
+    @staticmethod
+    def _apply_normalization(data, mu, std):
+        return (data - mu) / std
 
-            # ================== 2. 验证阶段 ==================
-            self.model.eval()
-            ema.apply_shadow()
-            val_loss, val_correct = 0.0, 0
+    def is_better_checkpoint(
+        self,
+        val_loss: float,
+        val_macro_acc: float,
+        best_val_loss: float,
+        best_val_macro_acc: float,
+    ) -> bool:
+        if val_macro_acc > best_val_macro_acc + self.model_selection_epsilon:
+            return True
+        if abs(val_macro_acc - best_val_macro_acc) <= self.model_selection_epsilon and val_loss < best_val_loss - self.model_selection_epsilon:
+            return True
+        if val_loss < best_val_loss - self.model_selection_epsilon:
+            return abs(val_macro_acc - best_val_macro_acc) <= 5 * self.model_selection_epsilon
+        if abs(val_loss - best_val_loss) <= self.model_selection_epsilon and val_macro_acc > best_val_macro_acc:
+            return True
+        return False
 
-            with torch.no_grad():
-                for v_imgs, v_labels in val_loader:
-                    v_imgs, v_labels = v_imgs.cuda(), v_labels.cuda()
-                    _, v_outputs     = self.model(v_imgs)
-                    v_loss           = self.criterion_cls(v_outputs, v_labels)
+    @staticmethod
+    def compute_subject_macro_accuracy(logits: Tensor, labels: Tensor, subject_ids: Tensor) -> float:
+        subject_scores = []
+        predictions = logits.argmax(dim=1)
+        for sid in subject_ids.unique(sorted=True):
+            subject_mask = subject_ids == sid
+            if subject_mask.any():
+                subject_acc = (predictions[subject_mask] == labels[subject_mask]).float().mean().item()
+                subject_scores.append(subject_acc)
+        if not subject_scores:
+            return 0.0
+        return float(np.mean(subject_scores))
 
-                    val_loss    += v_loss.item() * len(v_imgs)
-                    val_correct += (v_outputs.argmax(1) == v_labels).sum().item()
+    @staticmethod
+    def _log_subject_progress(split_name: str, index: int, total: int, sid: int):
+        print(f"[prepare] {split_name}: loading HC{sid} ({index}/{total})")
 
-            ema.restore()
-            avg_val_loss = val_loss / len(all_val_data)
-            avg_val_acc  = val_correct / len(all_val_data)
+    def _prepare_fold_data(self, train_val_subject_ids, test_subject_ids, val_ratio=0.125, fold_seed=42):
+        prepare_start = datetime.datetime.now()
+        train_val_subject_ids = np.array(train_val_subject_ids)
+        n_train_val = len(train_val_subject_ids)
+        n_val = max(1, int(n_train_val * val_ratio))
+        val_pick = np.random.RandomState(fold_seed).choice(np.arange(n_train_val), n_val, replace=False)
+        val_subject_ids = train_val_subject_ids[val_pick].tolist()
+        train_subject_ids = np.delete(train_val_subject_ids, val_pick).tolist()
 
-            print(f"  Epoch {epoch+1:2d}/{n_epochs} | "
-                  f"Train Loss: {avg_train_loss:.4f} Acc: {avg_train_acc:.4f} | "
-                  f"Val Loss: {avg_val_loss:.4f} Acc: {avg_val_acc:.4f}")
+        print(
+            f"[prepare] split train/val/test subjects: "
+            f"train={len(train_subject_ids)}, val={len(val_subject_ids)}, test={len(test_subject_ids)}"
+        )
 
-            # ================== 3. 最优保存与早停 ==================
-            if avg_val_acc > best_val_acc:
-                best_val_acc = avg_val_acc
+        train_data_list = []
+        train_label_list = []
+        for idx, sid in enumerate(train_subject_ids, 1):
+            self._log_subject_progress("train", idx, len(train_subject_ids), int(sid))
+            data, label = self._load_subject_data(int(sid))
+            train_data_list.append(data)
+            train_label_list.append(label)
+
+        train_base = np.concatenate(train_data_list, axis=0)
+        train_mu, train_std = self._compute_normalization_stats(train_base)
+        label_concat = np.concatenate(train_label_list, axis=0)
+        train_concat = self._apply_normalization(train_base, train_mu, train_std)
+        train_concat = np.ascontiguousarray(train_concat[:, np.newaxis], dtype=np.float32)
+        label_concat = np.ascontiguousarray(label_concat, dtype=np.int64)
+
+        val_data_list = []
+        val_label_list = []
+        for idx, sid in enumerate(val_subject_ids, 1):
+            self._log_subject_progress("val", idx, len(val_subject_ids), int(sid))
+            data, label = self._load_subject_data(int(sid))
+            data = self._apply_normalization(data, train_mu, train_std)
+            val_data_list.append(data)
+            val_label_list.append(label)
+
+        test_data_list = []
+        test_label_list = []
+        for idx, sid in enumerate(test_subject_ids, 1):
+            self._log_subject_progress("test", idx, len(test_subject_ids), int(sid))
+            data, label = self._load_subject_data(int(sid))
+            data = self._apply_normalization(data, train_mu, train_std)
+            test_data_list.append(data)
+            test_label_list.append(label)
+
+        val_concat = np.concatenate(val_data_list, axis=0)
+        val_label_concat = np.concatenate(val_label_list, axis=0)
+        test_concat = np.concatenate(test_data_list, axis=0)
+        test_label_concat = np.concatenate(test_label_list, axis=0)
+
+        val_concat = np.ascontiguousarray(val_concat[:, np.newaxis], dtype=np.float32)
+        test_concat = np.ascontiguousarray(test_concat[:, np.newaxis], dtype=np.float32)
+        val_label_concat = np.ascontiguousarray(val_label_concat, dtype=np.int64)
+        test_label_concat = np.ascontiguousarray(test_label_concat, dtype=np.int64)
+
+        perm = np.random.permutation(len(train_concat))
+        train_concat = train_concat[perm]
+        label_concat = label_concat[perm]
+
+        print(
+            f"[prepare] done: train={train_concat.shape}, val={val_concat.shape}, "
+            f"test={test_concat.shape}, elapsed={datetime.datetime.now() - prepare_start}"
+        )
+
+        return (
+            train_concat,
+            label_concat,
+            val_concat,
+            val_label_concat,
+            test_concat,
+            test_label_concat,
+            train_subject_ids,
+            val_subject_ids,
+            np.concatenate(
+                [
+                    np.full(len(labels), int(sid), dtype=np.int64)
+                    for sid, labels in zip(val_subject_ids, val_label_list)
+                ]
+            ),
+        )
+
+    def run_subject_cv(
+        self,
+        subject_ids,
+        save_dir,
+        n_epochs=200,
+        batch_size=128,
+        patience=60,
+        min_epochs=40,
+        seed=42,
+        val_ratio=0.25,
+        n_tta=5,
+        num_workers=4,
+        start_fold=1,
+        end_fold=999,
+        common_ckpt_name="finetuned_best.pth",
+    ):
+        os.makedirs(save_dir, exist_ok=True)
+        kf = KFold(n_splits=5, shuffle=True, random_state=seed)
+        fold_splits = list(enumerate(kf.split(np.array(subject_ids)), 1))
+        end_fold = min(end_fold, len(fold_splits))
+
+        fold_results = []
+        processed_folds = []
+        best_overall_val_loss = float("inf")
+        best_overall_val_acc = float("-inf")
+        common_ckpt_path = os.path.join(save_dir, common_ckpt_name)
+
+        for fold_idx, (train_val_idx, test_idx) in fold_splits:
+            if fold_idx < start_fold or fold_idx > end_fold:
+                continue
+
+            self._reset_model()
+
+            train_val_subjects = np.array(subject_ids)[train_val_idx].tolist()
+            test_subjects = np.array(subject_ids)[test_idx].tolist()
+
+            print(f"[fold {fold_idx}] preparing fold data...")
+
+            (
+                train_data,
+                train_label,
+                val_data,
+                val_label,
+                test_data,
+                test_label,
+                train_subjects,
+                val_subjects,
+                val_subject_ids_per_sample,
+            ) = self._prepare_fold_data(
+                train_val_subjects,
+                test_subjects,
+                val_ratio=val_ratio,
+                fold_seed=seed + fold_idx,
+            )
+
+            print(f"\n{'=' * 60}\nFold {fold_idx}/5\n{'=' * 60}")
+            print(f"Train subjects: {train_subjects}")
+            print(f"Val subjects: {val_subjects}")
+            print(f"Test subjects: {test_subjects}")
+            print(f"Train: {len(train_label)} samples, Val: {len(val_label)}, Test: {len(test_label)}")
+
+            train_dataset = torch.utils.data.TensorDataset(
+                torch.tensor(train_data, dtype=torch.float32),
+                torch.tensor(train_label, dtype=torch.long),
+            )
+            val_dataset = torch.utils.data.TensorDataset(
+                torch.tensor(val_data, dtype=torch.float32),
+                torch.tensor(val_label, dtype=torch.long),
+                torch.tensor(val_subject_ids_per_sample, dtype=torch.long),
+            )
+            test_data_tensor = torch.tensor(test_data, dtype=torch.float32, device=self.device)
+            test_label_tensor = torch.tensor(test_label, dtype=torch.long, device=self.device)
+
+            use_pin_memory = self.device.type == "cuda"
+            train_loader_kwargs = {
+                "batch_size": batch_size,
+                "shuffle": True,
+                "num_workers": num_workers,
+                "pin_memory": use_pin_memory,
+            }
+            val_loader_kwargs = {
+                "batch_size": batch_size,
+                "shuffle": False,
+                "num_workers": num_workers,
+                "pin_memory": use_pin_memory,
+            }
+            if num_workers > 0:
+                train_loader_kwargs["persistent_workers"] = True
+                train_loader_kwargs["prefetch_factor"] = 2
+                val_loader_kwargs["persistent_workers"] = True
+                val_loader_kwargs["prefetch_factor"] = 2
+
+            train_loader = torch.utils.data.DataLoader(train_dataset, **train_loader_kwargs)
+            val_loader = torch.utils.data.DataLoader(val_dataset, **val_loader_kwargs)
+
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.lr,
+                betas=(self.b1, self.b2),
+                weight_decay=self.weight_decay,
+            )
+            scheduler = warmup_cosine_scheduler(optimizer, warmup_epochs=5, total_epochs=n_epochs)
+            ema = EMA(self.model, decay=0.999)
+            scaler = torch.cuda.amp.GradScaler(enabled=self.amp_enabled)
+
+            best_val_loss = float("inf")
+            best_val_macro_acc = float("-inf")
+            best_val_acc = float("-inf")
+            patience_counter = 0
+            best_save_path = os.path.join(save_dir, f"subjectcv_fold{fold_idx}_best.pth")
+
+            for epoch in range(n_epochs):
+                self.model.train()
+                train_loss = 0.0
+                train_correct = 0
+
+                for imgs, labels in train_loader:
+                    imgs = imgs.to(self.device, non_blocking=use_pin_memory)
+                    labels = labels.to(self.device, non_blocking=use_pin_memory)
+                    imgs = self.augment(imgs)
+
+                    use_mixup = torch.rand(1, device=self.device).item() < self.mixup_prob
+                    labels_for_acc = labels
+
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+                        if use_mixup:
+                            imgs, labels_a, labels_b, lam = ExGAN.mixup(imgs, labels, alpha=self.mixup_alpha)
+                            _, outputs = self.model(imgs)
+                            loss = lam * self.criterion_train(outputs, labels_a) + (1 - lam) * self.criterion_train(outputs, labels_b)
+                            labels_for_acc = labels_a
+                        else:
+                            _, outputs = self.model(imgs)
+                            loss = self.criterion_train(outputs, labels)
+
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    ema.update()
+
+                    train_loss += loss.item() * len(imgs)
+                    if use_mixup:
+                        pred = outputs.argmax(1)
+                        mix_acc = lam * (pred == labels_a).float() + (1 - lam) * (pred == labels_b).float()
+                        train_correct += mix_acc.sum().item()
+                    else:
+                        train_correct += (outputs.argmax(1) == labels_for_acc).sum().item()
+
+                scheduler.step()
+                avg_train_loss = train_loss / len(train_label)
+                avg_train_acc = train_correct / len(train_label)
+
+                self.model.eval()
                 ema.apply_shadow()
-                torch.save(self.model.state_dict(), best_save_path)
+                val_loss = 0.0
+                val_correct = 0
+                val_logits_batches = []
+                val_label_batches = []
+                val_subject_batches = []
+                with torch.no_grad():
+                    for v_imgs, v_labels, v_subjects in val_loader:
+                        v_imgs = v_imgs.to(self.device, non_blocking=use_pin_memory)
+                        v_labels = v_labels.to(self.device, non_blocking=use_pin_memory)
+                        v_subjects = v_subjects.to(self.device, non_blocking=use_pin_memory)
+                        with torch.cuda.amp.autocast(enabled=self.amp_enabled):
+                            _, v_outputs = self.model(v_imgs)
+                            v_loss = self.criterion_eval(v_outputs, v_labels)
+                        val_loss += v_loss.item() * len(v_imgs)
+                        val_correct += (v_outputs.argmax(1) == v_labels).sum().item()
+                        val_logits_batches.append(v_outputs.detach())
+                        val_label_batches.append(v_labels.detach())
+                        val_subject_batches.append(v_subjects.detach())
                 ema.restore()
-                patience_counter = 0
-                print(f"new best:save to: {best_save_path}")
-            else:
-                patience_counter += 1
 
-            if patience_counter >= patience:
-                print(f"连续 {patience} 个 Epoch 验证集精度未提升，触发 Early Stopping，提前终止预训练！")
-                break
+                avg_val_loss = val_loss / len(val_label)
+                avg_val_acc = val_correct / len(val_label)
+                val_logits_all = torch.cat(val_logits_batches, dim=0)
+                val_labels_all = torch.cat(val_label_batches, dim=0)
+                val_subjects_all = torch.cat(val_subject_batches, dim=0)
+                avg_val_macro_acc = self.compute_subject_macro_accuracy(val_logits_all, val_labels_all, val_subjects_all)
 
-        print(f"\n[全局预训练结束] 历史最高验证集精度 (Best Val Acc): {best_val_acc * 100:.2f}%")
-        return best_save_path
+                print(
+                    f"Epoch {epoch + 1:3d}/{n_epochs} | "
+                    f"Train Loss: {avg_train_loss:.4f} Acc: {avg_train_acc:.4f} | "
+                    f"Val Loss: {avg_val_loss:.4f} Acc: {avg_val_acc:.4f} Macro: {avg_val_macro_acc:.4f}"
+                )
 
-    # ── 重写：单次微调 (直接返回最高精度) ───────────────────────────────────
-    def finetune_once(self, sid: int, save_dir: str, n_epochs: int = 15, batch_size: int = 32, n_tta: int = 5):
-        train_data, train_label, test_data, test_label = self._get_train_test_data(sid)
-
-        dataset = torch.utils.data.TensorDataset(
-            torch.tensor(train_data,  dtype=torch.float32),
-            torch.tensor(train_label, dtype=torch.long)
-        )
-        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-        test_data_gpu  = torch.tensor(test_data,  dtype=torch.float32).cuda()
-        test_label_gpu = torch.tensor(test_label, dtype=torch.long).cuda()
-
-        finetune_lr = self.lr * 0.1
-        optimizer   = torch.optim.Adam(self.model.parameters(), lr=finetune_lr, betas=(self.b1, self.b2))
-        scheduler = warmup_cosine_scheduler(optimizer, warmup_epochs=2, total_epochs=n_epochs)
-        ema = EMA(self.model, decay=0.999)
-
-        best_acc = 0.0
-        best_save_path = os.path.join(save_dir, f'finetuned_best.pth')
-
-        for epoch in range(n_epochs):
-            self.model.train()
-            for imgs, labels in loader:
-                imgs, labels = imgs.cuda(), labels.cuda()
-                imgs = ExGAN.augment(imgs)
-                if torch.rand(1).item() < 0.5:
-                    imgs, labels_a, labels_b, lam = ExGAN.mixup(imgs, labels, alpha=0.1)
-                    _, outputs = self.model(imgs)
-                    loss = lam * self.criterion_cls(outputs, labels_a) + \
-                           (1 - lam) * self.criterion_cls(outputs, labels_b)
+                if self.is_better_checkpoint(avg_val_loss, avg_val_macro_acc, best_val_loss, best_val_macro_acc):
+                    best_val_loss = avg_val_loss
+                    best_val_macro_acc = avg_val_macro_acc
+                    best_val_acc = avg_val_acc
+                    ema.apply_shadow()
+                    torch.save(self._cpu_state_dict(self.model), best_save_path)
+                    ema.restore()
+                    patience_counter = 0
+                    print(
+                        f"new best: loss={best_val_loss:.4f}, "
+                        f"macro={best_val_macro_acc:.4f}, acc={best_val_acc:.4f}, save to: {best_save_path}"
+                    )
                 else:
-                    _, outputs = self.model(imgs)
-                    loss = self.criterion_cls(outputs, labels)
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                optimizer.step()
-                ema.update()
-            scheduler.step()
+                    patience_counter += 1
+
+                if epoch + 1 >= min_epochs and patience_counter >= patience:
+                    print(f"Early stopping after {patience} epochs without val loss improvement.")
+                    break
+
+            best_state = torch.load(best_save_path, map_location="cpu")
+            self.model.load_state_dict(best_state, strict=True)
 
             self.model.eval()
-            ema.apply_shadow()
             with torch.no_grad():
-                cls_out = self.tta_evaluate(test_data_gpu, n_views=n_tta)
-            ema.restore()
+                cls_out = self.batched_predict(test_data_tensor, batch_size=batch_size, n_tta=n_tta)
 
             y_pred = cls_out.argmax(dim=1)
-            acc    = (y_pred == test_label_gpu).float().mean().item()
+            test_acc = (y_pred == test_label_tensor).float().mean().item()
+            fold_results.append(test_acc)
+            processed_folds.append(fold_idx)
 
-            if acc > best_acc:
-                best_acc = acc
-                ema.apply_shadow()
-                torch.save(self.model.state_dict(), best_save_path)
-                ema.restore()
+            if self.is_better_checkpoint(best_val_loss, best_val_macro_acc, best_overall_val_loss, best_overall_val_acc):
+                best_overall_val_loss = best_val_loss
+                best_overall_val_acc = best_val_macro_acc
+                torch.save(best_state, common_ckpt_path)
 
-        return best_acc
+            print(
+                f"Fold {fold_idx} Test Acc: {test_acc * 100:.2f}% "
+                f"(best val loss: {best_val_loss:.4f}, best val macro: {best_val_macro_acc * 100:.2f}%, "
+                f"best val acc: {best_val_acc * 100:.2f}%)"
+            )
+
+        if not fold_results:
+            print("No folds were run.")
+            return []
+
+        mean_acc = float(np.mean(fold_results))
+        std_acc = float(np.std(fold_results))
+
+        print(f"\n{'=' * 60}")
+        print(f"CV Results: {[f'{acc * 100:.2f}' for acc in fold_results]}")
+        print(f"Mean: {mean_acc * 100:.2f}% +- {std_acc * 100:.2f}%")
+        print(f"Best shared checkpoint: {common_ckpt_path}")
+        print(f"{'=' * 60}")
+
+        with open(os.path.join(save_dir, "CV_RESULTS.txt"), "w", encoding="utf-8") as f:
+            f.write("EEG-Conformer 5-Fold CV Results\n")
+            f.write(f"Folds run: {processed_folds}\n")
+            f.write(f"Fold accuracies: {fold_results}\n")
+            f.write(f"Mean: {mean_acc * 100:.2f}% +- {std_acc * 100:.2f}%\n")
+            f.write(f"Best shared checkpoint: {common_ckpt_path}\n")
+
+        return fold_results
 
 
-def warmup_cosine_scheduler(optimizer, warmup_epochs: int, total_epochs: int):
-    """前 warmup_epochs 线性升温，之后余弦退火。"""
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / warmup_epochs
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return 0.5 * (1 + np.cos(np.pi * progress))
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+def parse_args():
+    parser = argparse.ArgumentParser(description="EEG-Conformer subject-level 5-fold CV training.")
+    parser.add_argument("--data_dir", type=str, default="./EEG-Conformer/data/processed_normal/")
+    parser.add_argument("--save_dir", type=str, default="./EEG-Conformer/last_params/")
+    parser.add_argument("--gpu", type=str, default="0")
+    parser.add_argument("--emb_size", type=int, default=40)
+    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--min_epochs", type=int, default=40)
+    parser.add_argument("--lr", type=float, default=1.5e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model_seed", type=int, default=-1)
+    parser.add_argument("--val_ratio", type=float, default=0.25)
+    parser.add_argument("--n_tta", type=int, default=1)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--use_denoise", dest="use_denoise", action="store_true")
+    parser.add_argument("--no_denoise", dest="use_denoise", action="store_false")
+    parser.set_defaults(use_denoise=True)
+    parser.add_argument("--disable_amp", action="store_true", default=False)
+    parser.add_argument("--aug_noise_std", type=float, default=0.02)
+    parser.add_argument("--aug_shift", type=int, default=12)
+    parser.add_argument("--channel_mask_prob", type=float, default=0.15)
+    parser.add_argument("--channel_drop_prob", type=float, default=0.08)
+    parser.add_argument("--mixup_prob", type=float, default=0.2)
+    parser.add_argument("--mixup_alpha", type=float, default=0.2)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--tta_shift", type=int, default=4)
+    parser.add_argument("--start_fold", type=int, default=1)
+    parser.add_argument("--end_fold", type=int, default=1)
+    parser.add_argument("--common_ckpt_name", type=str, default="finetuned_best.pth")
+    return parser.parse_args()
+
+
+def configure_gpus(gpu_arg: str):
+    global gpus
+    gpu_values = [item.strip() for item in str(gpu_arg).split(",") if item.strip()]
+    gpus = [int(item) for item in gpu_values] if gpu_values else [0]
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(item) for item in gpus)
 
 
 def read_data(data_dir: str):
-    subject_ids = sorted([
-        int(os.path.basename(f).replace('HC', '').replace('_1s.mat', ''))
-        for f in glob.glob(os.path.join(data_dir, 'HC*_1s.mat'))
-    ])
+    subject_ids = sorted(
+        [
+            int(os.path.basename(f).replace("HC", "").replace("_1s.mat", ""))
+            for f in glob.glob(os.path.join(data_dir, "HC*_1s.mat"))
+        ]
+    )
     return subject_ids
 
+
 def main():
-    DATA_DIR = "./EEG-Conformer/data/processed_normal/"
-    SAVE_DIR = "./EEG-Conformer/last_params/"
-    emb_size = 40
-    depth   = 2
+    args = parse_args()
+    configure_gpus(args.gpu)
 
-    # 自动扫描受试者列表
-    subject_ids = read_data(DATA_DIR)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    subject_ids = read_data(args.data_dir)
     n_subjects = len(subject_ids)
-
     if n_subjects == 0:
-        print(f"未在 {DATA_DIR} 找到数据，请检查路径。")
+        print(f"No data found under {args.data_dir}")
         return
 
-    print(f"找到 {n_subjects} 个受试者: {subject_ids}")
+    print(f"Using device: {device}")
+    print(f"Found {n_subjects} subjects: {subject_ids}")
 
-    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=emb_size)
-    print(f"[Info] 动态推理 seq_len = {seq_len}")
+    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=args.emb_size)
+    print(f"[Info] seq_len = {seq_len}")
 
-    starttime = datetime.datetime.now()
+    start_time = datetime.datetime.now()
+    model_seed = args.model_seed if args.model_seed >= 0 else args.seed
 
-    global_trainer = ExGAN(data_dir=DATA_DIR, seq_len=seq_len, depth=depth, emb_size=emb_size)
-
-    # ── 阶段 1: 全局预训练 (EMA + Mixup) ──
-    best_weights_path = global_trainer.pretrain_once(
-        subject_ids=subject_ids,
-        save_dir=SAVE_DIR,
-        n_epochs=300,
-        batch_size=128,
-        patience=120
+    trainer = ExGAN(
+        data_dir=args.data_dir,
+        seq_len=seq_len,
+        depth=args.depth,
+        emb_size=args.emb_size,
+        device=device,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        model_seed=model_seed,
+        use_denoise=args.use_denoise,
+        amp_enabled=not args.disable_amp,
+        aug_noise_std=args.aug_noise_std,
+        aug_shift=args.aug_shift,
+        channel_mask_prob=args.channel_mask_prob,
+        channel_drop_prob=args.channel_drop_prob,
+        mixup_prob=args.mixup_prob,
+        mixup_alpha=args.mixup_alpha,
+        label_smoothing=args.label_smoothing,
+        tta_shift=args.tta_shift,
     )
-
-    # ── 阶段 2: 逐被试微调 + TTA 评估 ──
-    print(f"\n{'='*50}")
-    print("开始逐被试微调 + TTA 测试...")
-    print(f"{'='*50}")
-
-    acc_list = []
-    n_tta = 5
-
-    for sid in subject_ids:
-        global_trainer.model.load_state_dict(
-            torch.load(best_weights_path, map_location='cuda'), strict=True
-        )
-        acc = global_trainer.finetune_once(sid, SAVE_DIR, n_epochs=15, batch_size=32, n_tta=n_tta)
-        acc_list.append(acc)
-        print(f"  被试 HC{sid} TTA-{n_tta} 测试最高精度: {acc * 100:.2f}%")
-
-    avg_acc = np.mean(acc_list)
-    std_acc = np.std(acc_list)
-    print(f"\n{'='*50}")
-    print(f"全部 {n_subjects} 个被试测试完毕 (TTA-{n_tta})")
-    print(f"平均精度: {avg_acc * 100:.2f}% ± {std_acc * 100:.2f}%")
-    print(f"总耗时: {datetime.datetime.now() - starttime}")
-    print(f"{'='*50}")
-
+    trainer.run_subject_cv(
+        subject_ids=subject_ids,
+        save_dir=args.save_dir,
+        n_epochs=args.epochs,
+        batch_size=args.batch_size,
+        patience=args.patience,
+        min_epochs=args.min_epochs,
+        seed=args.seed,
+        val_ratio=args.val_ratio,
+        n_tta=args.n_tta,
+        num_workers=args.num_workers,
+        start_fold=args.start_fold,
+        end_fold=args.end_fold,
+        common_ckpt_name=args.common_ckpt_name,
+    )
+    print(f"Total elapsed: {datetime.datetime.now() - start_time}")
 
 
 if __name__ == "__main__":
