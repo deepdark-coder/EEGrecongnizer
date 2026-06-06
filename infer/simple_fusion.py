@@ -1,4 +1,5 @@
 import argparse
+import argparse
 import csv
 import re
 import sys
@@ -50,6 +51,13 @@ def parse_args():
     )
     parser.add_argument("--de_data_dir", type=str, default=str(ROOT / "data" / "code" / "processed_testset"))
     parser.add_argument("--mat_data_dir", type=str, default=str(ROOT / "EEG-Conformer" / "data" / "processed_testset"))
+    parser.add_argument(
+        "--extra_data_dir",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Optional extra data directories. Any directory containing *_X.npy will be added to the DE-based models, and any directory containing *.mat will be added to EEG-Conformer.",
+    )
 
     parser.add_argument("--edge_ckpt", type=str, default=str(ROOT / "params" / "edgeconv_best.pth"))
     parser.add_argument("--labram_ckpt", type=str, default=str(ROOT / "params" / "labram_best.pth"))
@@ -172,17 +180,66 @@ def parse_mat_subject_id(mat_file):
     return mat_file.stem
 
 
-def find_de_subjects(data_dir):
-    data_dir = Path(data_dir)
-    subjects = []
-    for x_file in sorted(data_dir.glob("*_X.npy")):
-        y_file = data_dir / x_file.name.replace("_X.npy", "_Y.npy")
-        if not y_file.exists():
+def normalize_input_dirs(primary_dir, extra_dirs):
+    dirs = []
+    seen = set()
+    for raw_path in [primary_dir] + list(extra_dirs):
+        if not raw_path:
             continue
-        subjects.append((parse_npy_subject_id(x_file), x_file, y_file))
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError("Data directory does not exist: %s" % path)
+        if not path.is_dir():
+            raise NotADirectoryError("Expected a directory path: %s" % path)
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(path)
+    return dirs
+
+
+def find_de_subjects(primary_dir, extra_dirs):
+    subjects = []
+    discovered_dirs = []
+    subject_sources = {}
+    for data_dir in normalize_input_dirs(primary_dir, extra_dirs):
+        discovered_dirs.append(str(data_dir))
+        for x_file in sorted(data_dir.glob("*_X.npy")):
+            y_file = data_dir / x_file.name.replace("_X.npy", "_Y.npy")
+            if not y_file.exists():
+                continue
+            subject_id = parse_npy_subject_id(x_file)
+            if subject_id in subject_sources:
+                raise ValueError(
+                    "Duplicate DE subject_id %s found in %s and %s"
+                    % (subject_id, subject_sources[subject_id], x_file)
+                )
+            subject_sources[subject_id] = str(x_file)
+            subjects.append((subject_id, x_file, y_file))
     if not subjects:
-        raise FileNotFoundError("No *_X.npy / *_Y.npy pairs found under %s" % data_dir)
-    return subjects
+        raise FileNotFoundError("No *_X.npy / *_Y.npy pairs found under: %s" % ", ".join(discovered_dirs))
+    return sorted(subjects, key=lambda item: item[0])
+
+
+def find_mat_files(primary_dir, extra_dirs):
+    mat_files = []
+    discovered_dirs = []
+    subject_sources = {}
+    for data_dir in normalize_input_dirs(primary_dir, extra_dirs):
+        discovered_dirs.append(str(data_dir))
+        for mat_path in sorted(data_dir.glob("*.mat"), key=sort_mat_key):
+            subject_id = parse_mat_subject_id(mat_path)
+            if subject_id in subject_sources:
+                raise ValueError(
+                    "Duplicate EEG subject_id %s found in %s and %s"
+                    % (subject_id, subject_sources[subject_id], mat_path)
+                )
+            subject_sources[subject_id] = str(mat_path)
+            mat_files.append(mat_path)
+    if not mat_files:
+        raise FileNotFoundError("No .mat files found under: %s" % ", ".join(discovered_dirs))
+    return sorted(mat_files, key=sort_mat_key)
 
 
 def build_de_chunks(x_label, window_size, stride, use_asymmetry):
@@ -262,9 +319,9 @@ def load_edge_model(args, device):
     return model
 
 
-def run_edge_model(args, model, device):
+def run_edge_model(args, model, device, de_subjects):
     scores = {}
-    for subject_id, x_file, y_file in find_de_subjects(args.de_data_dir):
+    for subject_id, x_file, y_file in de_subjects:
         x = np.load(x_file)
         y = np.load(y_file).astype(np.int64)
         x = zscore_subject(x)
@@ -324,9 +381,9 @@ def forward_labram(model, batch, input_chans):
     return model(batch, input_chans=input_chans)
 
 
-def run_labram_model(args, model, input_chans, device):
+def run_labram_model(args, model, input_chans, device, de_subjects):
     scores = {}
-    for subject_id, x_file, y_file in find_de_subjects(args.de_data_dir):
+    for subject_id, x_file, y_file in de_subjects:
         x = np.load(x_file).astype(np.float32)
         y = np.load(y_file).astype(np.int64)
         for label in sorted(np.unique(y).tolist()):
@@ -371,17 +428,13 @@ def load_eeg_model(args, device):
     return model
 
 
-def run_eeg_model(args, model, device):
+def run_eeg_model(args, model, device, mat_files):
     try:
         import scipy.io as sio
     except ImportError as exc:
         raise ImportError("EEG-Conformer inference needs scipy for reading .mat files.") from exc
 
     scores = {}
-    mat_files = sorted(Path(args.mat_data_dir).glob("*.mat"), key=sort_mat_key)
-    if not mat_files:
-        raise FileNotFoundError("No .mat files found under %s" % args.mat_data_dir)
-
     for mat_path in mat_files:
         subject_id = parse_mat_subject_id(mat_path)
         mat = sio.loadmat(str(mat_path))
@@ -467,23 +520,35 @@ def main():
 
     score_maps = {}
     weight_map = {}
+    de_subjects = None
+    mat_files = None
+
+    if args.edge_ckpt or args.labram_ckpt:
+        de_subjects = find_de_subjects(args.de_data_dir, args.extra_data_dir)
+        print("DE data sources:", [args.de_data_dir] + list(args.extra_data_dir))
+        print("Loaded DE subjects:", len(de_subjects))
+
+    if args.eeg_ckpt:
+        mat_files = find_mat_files(args.mat_data_dir, args.extra_data_dir)
+        print("EEG data sources:", [args.mat_data_dir] + list(args.extra_data_dir))
+        print("Loaded EEG subjects:", len(mat_files))
 
     if args.edge_ckpt:
         print("Loading EdgeConv...")
         edge_model = load_edge_model(args, device)
-        score_maps["edgeconv"] = run_edge_model(args, edge_model, device)
+        score_maps["edgeconv"] = run_edge_model(args, edge_model, device, de_subjects)
         weight_map["edgeconv"] = args.edge_weight
 
     if args.labram_ckpt:
         print("Loading LaBraM...")
         labram_model, input_chans = load_labram_model(args, device)
-        score_maps["labram"] = run_labram_model(args, labram_model, input_chans, device)
+        score_maps["labram"] = run_labram_model(args, labram_model, input_chans, device, de_subjects)
         weight_map["labram"] = args.labram_weight
 
     if args.eeg_ckpt:
         print("Loading EEG-Conformer...")
         eeg_model = load_eeg_model(args, device)
-        score_maps["eeg_conformer"] = run_eeg_model(args, eeg_model, device)
+        score_maps["eeg_conformer"] = run_eeg_model(args, eeg_model, device, mat_files)
         weight_map["eeg_conformer"] = args.eeg_weight
 
     if not score_maps:

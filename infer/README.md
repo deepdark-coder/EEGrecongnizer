@@ -82,6 +82,30 @@ python infer/simple_fusion.py \
   --eeg_weight 1.0
 ```
 
+### 4. 追加 extra 测试数据目录
+
+如果你有新的测试数据放在别的目录，可以直接追加：
+
+```bash
+python infer/simple_fusion.py \
+  --de_data_dir processed_normal \
+  --mat_data_dir EEG-Conformer/data/processed_normal \
+  --extra_data_dir new_testset_dir another_testset_dir \
+  --edge_ckpt path/to/edgeconv.pth \
+  --labram_ckpt path/to/labram.pth \
+  --eeg_ckpt EEG-Conformer/last_params/better_D2_H4_S40_best1.pth
+```
+
+这个参数会自动识别：
+
+- 包含 `*_X.npy` / `*_Y.npy` 的目录，会并入 EdgeConv 和 LaBraM
+- 包含 `*.mat` 的目录，会并入 EEG-Conformer
+
+注意：
+
+- 如果不同目录里有同名 `subject_id`，脚本会直接报错，避免静默覆盖
+- 最终融合仍然要求三个模型在 `(subject_id, label)` 上能对齐
+
 ## 输出
 
 默认输出到：

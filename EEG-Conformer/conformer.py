@@ -122,12 +122,83 @@ class AdaptiveSpatialAggregator(nn.Module):
         return self.token_norm(self.token_dropout(tokens))
 
 
+class BandTokenAggregator(nn.Module):
+    def __init__(self, in_channels: int, emb_size: int):
+        super().__init__()
+        hidden_channels = max(16, in_channels // 2)
+        self.attn_logits = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, (1, 1), bias=False),
+            nn.GroupNorm(pick_group_count(hidden_channels), hidden_channels),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, 1, (1, 1), bias=True),
+        )
+        self.value_proj = nn.Sequential(
+            nn.Conv2d(in_channels, emb_size, (1, 1), bias=False),
+            nn.GroupNorm(pick_group_count(emb_size), emb_size),
+            nn.SiLU(),
+        )
+        self.token_dropout = nn.Dropout(0.1)
+        self.token_norm = nn.LayerNorm(emb_size)
+
+    def forward(self, x: Tensor) -> Tensor:
+        logits = self.attn_logits(x)
+        attn = torch.softmax(logits / (x.shape[1] ** 0.5), dim=2)
+        values = self.value_proj(x)
+        tokens = (attn * values).sum(dim=2).transpose(1, 2)
+        return self.token_norm(self.token_dropout(tokens))
+
+
+class BandPowerEncoder(nn.Module):
+    def __init__(self, sampling_rate: int = 250):
+        super().__init__()
+        self.sampling_rate = sampling_rate
+        self.band_limits = (
+            (1.0, 4.0),
+            (4.0, 8.0),
+            (8.0, 13.0),
+            (13.0, 30.0),
+            (30.0, 45.0),
+        )
+        self.num_bands = len(self.band_limits)
+
+    def forward(self, x: Tensor) -> Tensor:
+        power = torch.abs(torch.fft.rfft(x.float(), dim=-1)).pow(2)[..., 1:]
+        total_power = power.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        freqs = torch.linspace(
+            0.0,
+            self.sampling_rate / 2,
+            power.shape[-1] + 1,
+            device=power.device,
+            dtype=power.dtype,
+        )[1:]
+        absolute_maps = []
+        relative_maps = []
+        for low_hz, high_hz in self.band_limits:
+            mask = (freqs >= low_hz) & (freqs < high_hz)
+            if mask.any():
+                band_energy = power[..., mask].sum(dim=-1)
+            else:
+                center_idx = int(torch.argmin((freqs - (low_hz + high_hz) * 0.5).abs()).item())
+                band_energy = power[..., center_idx : center_idx + 1].sum(dim=-1)
+            absolute_maps.append(torch.log1p(band_energy).unsqueeze(-1))
+            relative_maps.append((band_energy / total_power.squeeze(-1)).unsqueeze(-1))
+
+        absolute_map = torch.cat(absolute_maps, dim=-1)
+        relative_map = torch.cat(relative_maps, dim=-1)
+        absolute_map = (absolute_map - absolute_map.mean(dim=-1, keepdim=True)) / (
+            absolute_map.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        )
+        relative_map = (relative_map - relative_map.mean(dim=-1, keepdim=True)) / (
+            relative_map.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        )
+        return torch.cat([absolute_map, relative_map], dim=1)
+
+
 class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size: int = 40, n_channels: int = 30):
+    def __init__(self, emb_size: int = 40, n_channels: int = 30, sampling_rate: int = 250):
         super().__init__()
         branch_channels = 20
         temporal_channels = branch_channels * 3
-        spectral_channels = branch_channels * 4
         feat_channels = 48
         feat_groups = pick_group_count(feat_channels)
         self.input_norm = SampleChannelNorm(n_channels)
@@ -163,46 +234,37 @@ class PatchEmbedding(nn.Module):
         )
         self.spatial_aggregator = AdaptiveSpatialAggregator(feat_channels, emb_size, spatial_heads=1)
 
-        self.spectral_pointwise = nn.Sequential(
-            nn.Conv2d(1, branch_channels, (1, 1), stride=(1, 1), bias=False),
-            nn.GroupNorm(pick_group_count(branch_channels), branch_channels),
+        self.band_encoder = BandPowerEncoder(sampling_rate=sampling_rate)
+        self.band_stem = nn.Sequential(
+            nn.Conv2d(2, feat_channels, (1, 1), stride=(1, 1), bias=False),
+            nn.GroupNorm(feat_groups, feat_channels),
             nn.SiLU(),
         )
-        self.spectral_branches = nn.ModuleList(
-            [
-                TemporalBranch(branch_channels, kernel_size=3, in_channels=branch_channels),
-                TemporalBranch(branch_channels, kernel_size=7, in_channels=branch_channels),
-                TemporalBranch(branch_channels, kernel_size=15, in_channels=branch_channels),
-            ]
-        )
-        self.spectral_fuse = nn.Sequential(
-            nn.Conv2d(spectral_channels, feat_channels, (1, 1), stride=(1, 1), bias=False),
-            nn.GroupNorm(feat_groups, feat_channels),
-            nn.ELU(),
-        )
-        self.spectral_context = nn.Sequential(
+        self.band_context = nn.Sequential(
             nn.Conv2d(
                 feat_channels,
                 feat_channels,
-                (1, 5),
+                (1, 3),
                 stride=(1, 1),
-                padding=(0, 2),
+                padding=(0, 1),
                 groups=feat_channels,
                 bias=False,
             ),
             nn.GroupNorm(feat_groups, feat_channels),
             nn.SiLU(),
         )
-        self.spectral_reweight = SqueezeExcite2d(feat_channels)
-        self.spectral_pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d((n_channels, 24)),
-            nn.Dropout(0.25),
+        self.band_reweight = SqueezeExcite2d(feat_channels)
+        self.band_refine = nn.Sequential(
+            nn.Conv2d(feat_channels, feat_channels, (1, 1), stride=(1, 1), bias=False),
+            nn.GroupNorm(feat_groups, feat_channels),
+            nn.SiLU(),
         )
-        self.spectral_aggregator = AdaptiveSpatialAggregator(feat_channels, emb_size, spatial_heads=1)
+        self.band_tokens = BandTokenAggregator(feat_channels, emb_size)
         self.time_token_type = nn.Parameter(torch.randn(1, 1, emb_size) * 0.02)
-        self.freq_token_type = nn.Parameter(torch.randn(1, 1, emb_size) * 0.02)
+        self.band_token_type = nn.Parameter(torch.randn(1, 1, emb_size) * 0.02)
+        self.band_embedding = nn.Parameter(torch.randn(1, self.band_encoder.num_bands, emb_size) * 0.02)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor):
         x = self.input_norm(x)
         time_feat = torch.cat([branch(x) for branch in self.temporal_branches], dim=1)
         time_feat = self.temporal_fuse(time_feat)
@@ -212,20 +274,121 @@ class PatchEmbedding(nn.Module):
         time_tokens = self.spatial_aggregator(time_feat)
         time_tokens = time_tokens + self.time_token_type
 
-        spectrum = torch.log1p(torch.abs(torch.fft.rfft(x.float(), dim=-1)))[..., 1:]
-        spectral_base = self.spectral_pointwise(spectrum)
-        spectral_feat = torch.cat(
-            [spectral_base] + [branch(spectral_base) for branch in self.spectral_branches],
-            dim=1,
-        )
-        spectral_feat = self.spectral_fuse(spectral_feat)
-        spectral_feat = self.spectral_context(spectral_feat)
-        spectral_feat = self.spectral_reweight(spectral_feat)
-        spectral_feat = self.spectral_pool(spectral_feat)
-        freq_tokens = self.spectral_aggregator(spectral_feat).to(time_tokens.dtype)
-        freq_tokens = freq_tokens + self.freq_token_type
+        band_feat = self.band_encoder(x)
+        band_feat = self.band_stem(band_feat)
+        band_feat = self.band_context(band_feat)
+        band_feat = self.band_reweight(band_feat)
+        band_feat = self.band_refine(band_feat)
+        band_tokens = self.band_tokens(band_feat).to(time_tokens.dtype)
+        band_tokens = band_tokens + self.band_token_type + self.band_embedding
 
-        return torch.cat([time_tokens, freq_tokens], dim=1)
+        return time_tokens, band_tokens
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, emb_size: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.emb_size = emb_size
+        self.num_heads = num_heads
+        self.scale = (emb_size // num_heads) ** -0.5
+        self.query_proj = nn.Linear(emb_size, emb_size)
+        self.key_proj = nn.Linear(emb_size, emb_size)
+        self.value_proj = nn.Linear(emb_size, emb_size)
+        self.att_drop = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(emb_size, emb_size)
+
+    def forward(self, query: Tensor, context: Tensor) -> Tensor:
+        queries = rearrange(self.query_proj(query), "b n (h d) -> b h n d", h=self.num_heads)
+        keys = rearrange(self.key_proj(context), "b n (h d) -> b h n d", h=self.num_heads)
+        values = rearrange(self.value_proj(context), "b n (h d) -> b h n d", h=self.num_heads)
+
+        energy = torch.einsum("bhqd,bhkd->bhqk", queries, keys) * self.scale
+        att = self.att_drop(torch.softmax(energy, dim=-1))
+        out = torch.einsum("bhqk,bhkd->bhqd", att, values)
+        out = rearrange(out, "b h n d -> b n (h d)")
+        return self.out_proj(out)
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(
+        self,
+        emb_size: int,
+        num_heads: int = 4,
+        drop_p: float = 0.1,
+        forward_expansion: int = 4,
+        forward_drop_p: float = 0.1,
+        drop_path: float = 0.0,
+    ):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(emb_size)
+        self.context_norm = nn.LayerNorm(emb_size)
+        self.cross_attn = CrossAttention(emb_size, num_heads, drop_p)
+        self.cross_drop = nn.Dropout(drop_p)
+        self.cross_scale = LayerScale(emb_size)
+        self.cross_path = DropPath(drop_path)
+        self.ffn_norm = nn.LayerNorm(emb_size)
+        self.ffn = FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p)
+        self.ffn_drop = nn.Dropout(drop_p)
+        self.ffn_scale = LayerScale(emb_size)
+        self.ffn_path = DropPath(drop_path)
+        self.final_norm = nn.LayerNorm(emb_size)
+
+    def forward(self, x: Tensor, context: Tensor) -> Tensor:
+        x = x + self.cross_path(self.cross_scale(self.cross_drop(self.cross_attn(self.query_norm(x), self.context_norm(context)))))
+        x = x + self.ffn_path(self.ffn_scale(self.ffn_drop(self.ffn(self.ffn_norm(x)))))
+        return self.final_norm(x)
+
+
+class TimeFrequencyFusion(nn.Module):
+    def __init__(self, emb_size: int, num_heads: int = 4, drop_p: float = 0.1):
+        super().__init__()
+        self.time_to_band = CrossAttentionBlock(emb_size, num_heads=num_heads, drop_p=drop_p)
+        self.band_to_time = CrossAttentionBlock(emb_size, num_heads=num_heads, drop_p=drop_p)
+        self.time_gate = nn.Parameter(torch.full((1, 1, emb_size), 0.5))
+        self.band_gate = nn.Parameter(torch.full((1, 1, emb_size), 0.5))
+        self.time_norm = nn.LayerNorm(emb_size)
+        self.band_norm = nn.LayerNorm(emb_size)
+
+    def forward(self, time_tokens: Tensor, band_tokens: Tensor):
+        time_update = self.time_to_band(time_tokens, band_tokens)
+        band_update = self.band_to_time(band_tokens, time_tokens)
+        time_tokens = self.time_norm(time_tokens + torch.tanh(self.time_gate) * time_update)
+        band_tokens = self.band_norm(band_tokens + torch.tanh(self.band_gate) * band_update)
+        return time_tokens, band_tokens
+
+
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, lambda_value: float):
+        ctx.lambda_value = lambda_value
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        return -ctx.lambda_value * grad_output, None
+
+
+class GradientReversal(nn.Module):
+    def forward(self, x: Tensor, lambda_value: float) -> Tensor:
+        return GradientReversalFunction.apply(x, lambda_value)
+
+
+class SubjectDiscriminator(nn.Module):
+    def __init__(self, in_features: int, n_subjects: int):
+        super().__init__()
+        hidden_size = max(64, in_features // 2)
+        self.grl = GradientReversal()
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_features),
+            nn.Linear(in_features, hidden_size),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, n_subjects),
+        )
+
+    def forward(self, x: Tensor, lambda_value: float) -> Tensor:
+        x = self.grl(x, lambda_value)
+        return self.net(x)
 
 
 class MultiHeadAttention(nn.Module):
@@ -405,22 +568,39 @@ class ConvPositionalEncoding(nn.Module):
 
 
 class ViT(nn.Module):
-    def __init__(self, emb_size: int, depth: int, n_classes: int = 2, n_channels: int = 30, seq_len: int = 11):
+    def __init__(
+        self,
+        emb_size: int,
+        depth: int,
+        n_classes: int = 2,
+        n_channels: int = 30,
+        seq_len: int = 11,
+        sampling_rate: int = 250,
+        n_subjects: int = 0,
+    ):
         super().__init__()
-        self.patch_embedding = PatchEmbedding(emb_size, n_channels)
+        self.patch_embedding = PatchEmbedding(emb_size, n_channels, sampling_rate=sampling_rate)
+        self.fusion = TimeFrequencyFusion(emb_size)
         self.cls_token = nn.Parameter(torch.randn(1, 1, emb_size) * 0.02)
         self.pos_encoder = ConvPositionalEncoding(emb_size)
         self.pos_drop = nn.Dropout(0.1)
         self.transformer = TransformerEncoder(depth, emb_size)
         self.cls_head = ClassificationHead(emb_size, n_classes)
+        self.subject_head = SubjectDiscriminator(emb_size * 3, n_subjects) if n_subjects > 1 else None
 
-    def forward(self, x: Tensor):
-        x = self.patch_embedding(x)
+    def forward(self, x: Tensor, subject_lambda: float = 0.0):
+        time_tokens, band_tokens = self.patch_embedding(x)
+        time_tokens, band_tokens = self.fusion(time_tokens, band_tokens)
+        x = torch.cat([time_tokens, band_tokens], dim=1)
         cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
         x = torch.cat([cls_tokens, x], dim=1)
         x = self.pos_drop(self.pos_encoder(x))
         x = self.transformer(x)
-        return self.cls_head(x)
+        feat, logits = self.cls_head(x)
+        subject_logits = None
+        if self.subject_head is not None and subject_lambda > 0:
+            subject_logits = self.subject_head(feat, subject_lambda)
+        return feat, logits, subject_logits
 
 
 def warmup_cosine_scheduler(optimizer, warmup_epochs: int, total_epochs: int):
@@ -437,6 +617,7 @@ class ExGAN:
     def __init__(
         self,
         data_dir: str,
+        all_subject_ids,
         seq_len: int,
         depth: int,
         emb_size: int,
@@ -454,14 +635,20 @@ class ExGAN:
         mixup_alpha: float = 0.1,
         label_smoothing: float = 0.05,
         tta_shift: int = 8,
+        sampling_rate: int = 250,
+        subject_adv_weight: float = 0.05,
+        subject_adv_warmup: int = 8,
     ):
         self.n_channels = 30
         self.n_times = 250
         self.n_classes = 2
+        self.sampling_rate = sampling_rate
         self.lr = lr
         self.b1, self.b2 = 0.9, 0.999
         self.weight_decay = weight_decay
         self.data_dir = data_dir
+        self.all_subject_ids = [int(sid) for sid in all_subject_ids]
+        self.subject_id_to_index = {sid: idx for idx, sid in enumerate(self.all_subject_ids)}
         self.seq_len = seq_len
         self.depth = depth
         self.emb_size = emb_size
@@ -477,21 +664,29 @@ class ExGAN:
         self.mixup_alpha = mixup_alpha
         self.label_smoothing = label_smoothing
         self.tta_shift = tta_shift
+        self.subject_adv_weight = subject_adv_weight
+        self.subject_adv_warmup = subject_adv_warmup
         self.subject_cache = {}
         self.model_selection_epsilon = 1e-4
 
         self.criterion_train = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing).to(self.device)
         self.criterion_eval = nn.CrossEntropyLoss().to(self.device)
+        self.criterion_subject = nn.CrossEntropyLoss().to(self.device)
         self.model = None
         self._reset_model()
 
     @staticmethod
-    def get_seq_len(n_channels: int = 30, n_times: int = 250, emb_size: int = 16) -> int:
+    def get_seq_len(
+        n_channels: int = 30,
+        n_times: int = 250,
+        emb_size: int = 16,
+        sampling_rate: int = 250,
+    ) -> int:
         dummy = torch.zeros(1, 1, n_channels, n_times)
-        pe = PatchEmbedding(emb_size, n_channels)
+        pe = PatchEmbedding(emb_size, n_channels, sampling_rate=sampling_rate)
         with torch.no_grad():
-            out = pe(dummy)
-        return out.shape[1]
+            time_tokens, band_tokens = pe(dummy)
+        return time_tokens.shape[1] + band_tokens.shape[1]
 
     def augment(self, x: Tensor) -> Tensor:
         x = x + torch.randn_like(x) * self.aug_noise_std
@@ -546,6 +741,8 @@ class ExGAN:
             n_classes=self.n_classes,
             n_channels=self.n_channels,
             seq_len=self.seq_len,
+            sampling_rate=self.sampling_rate,
+            n_subjects=len(self.subject_id_to_index),
         ).to(self.device)
         if self.device.type == "cuda" and len(gpus) > 1:
             model = nn.DataParallel(model, device_ids=list(range(len(gpus)))).to(self.device)
@@ -564,7 +761,7 @@ class ExGAN:
         for shift in self.get_tta_shifts(n_views):
             x_aug = self.eval_augment(x.clone(), shift=shift)
             with torch.cuda.amp.autocast(enabled=self.amp_enabled):
-                _, out = self.model(x_aug)
+                _, out, _ = self.model(x_aug)
             logits_sum = out if logits_sum is None else logits_sum + out
         return logits_sum / n_views
 
@@ -579,7 +776,7 @@ class ExGAN:
                     logits = self.tta_evaluate(batch, n_views=n_tta)
                 else:
                     with torch.cuda.amp.autocast(enabled=self.amp_enabled):
-                        _, logits = self.model(batch)
+                        _, logits, _ = self.model(batch)
             except RuntimeError as exc:
                 if self.device.type != "cuda" or "cuDNN algorithm" not in str(exc):
                     raise
@@ -590,9 +787,18 @@ class ExGAN:
                         logits = self.tta_evaluate(batch, n_views=n_tta)
                     else:
                         with torch.cuda.amp.autocast(enabled=self.amp_enabled):
-                            _, logits = self.model(batch)
+                            _, logits, _ = self.model(batch)
             logits_list.append(logits)
         return torch.cat(logits_list, dim=0)
+
+    def get_subject_adv_lambda(self, epoch: int, total_epochs: int) -> float:
+        if self.subject_adv_weight <= 0 or len(self.subject_id_to_index) <= 1:
+            return 0.0
+        if epoch + 1 <= self.subject_adv_warmup:
+            return 0.0
+        progress = (epoch + 1 - self.subject_adv_warmup) / max(1, total_epochs - self.subject_adv_warmup)
+        progress = float(np.clip(progress, 0.0, 1.0))
+        return 2.0 / (1.0 + np.exp(-10.0 * progress)) - 1.0
 
     def _load_subject_data(self, sid: int):
         if sid in self.subject_cache:
@@ -675,9 +881,16 @@ class ExGAN:
         train_base = np.concatenate(train_data_list, axis=0)
         train_mu, train_std = self._compute_normalization_stats(train_base)
         label_concat = np.concatenate(train_label_list, axis=0)
+        train_subject_index_concat = np.concatenate(
+            [
+                np.full(len(labels), self.subject_id_to_index[int(sid)], dtype=np.int64)
+                for sid, labels in zip(train_subject_ids, train_label_list)
+            ]
+        )
         train_concat = self._apply_normalization(train_base, train_mu, train_std)
         train_concat = np.ascontiguousarray(train_concat[:, np.newaxis], dtype=np.float32)
         label_concat = np.ascontiguousarray(label_concat, dtype=np.int64)
+        train_subject_index_concat = np.ascontiguousarray(train_subject_index_concat, dtype=np.int64)
 
         val_data_list = []
         val_label_list = []
@@ -710,6 +923,7 @@ class ExGAN:
         perm = np.random.permutation(len(train_concat))
         train_concat = train_concat[perm]
         label_concat = label_concat[perm]
+        train_subject_index_concat = train_subject_index_concat[perm]
 
         print(
             f"[prepare] done: train={train_concat.shape}, val={val_concat.shape}, "
@@ -723,6 +937,7 @@ class ExGAN:
             val_label_concat,
             test_concat,
             test_label_concat,
+            train_subject_index_concat,
             train_subject_ids,
             val_subject_ids,
             np.concatenate(
@@ -778,6 +993,7 @@ class ExGAN:
                 val_label,
                 test_data,
                 test_label,
+                train_subject_index,
                 train_subjects,
                 val_subjects,
                 val_subject_ids_per_sample,
@@ -797,6 +1013,7 @@ class ExGAN:
             train_dataset = torch.utils.data.TensorDataset(
                 torch.tensor(train_data, dtype=torch.float32),
                 torch.tensor(train_label, dtype=torch.long),
+                torch.tensor(train_subject_index, dtype=torch.long),
             )
             val_dataset = torch.utils.data.TensorDataset(
                 torch.tensor(val_data, dtype=torch.float32),
@@ -847,11 +1064,15 @@ class ExGAN:
             for epoch in range(n_epochs):
                 self.model.train()
                 train_loss = 0.0
+                train_adv_loss = 0.0
                 train_correct = 0
+                subject_lambda = self.get_subject_adv_lambda(epoch, n_epochs)
+                subject_loss_weight = self.subject_adv_weight * subject_lambda
 
-                for imgs, labels in train_loader:
+                for imgs, labels, subject_labels in train_loader:
                     imgs = imgs.to(self.device, non_blocking=use_pin_memory)
                     labels = labels.to(self.device, non_blocking=use_pin_memory)
+                    subject_labels = subject_labels.to(self.device, non_blocking=use_pin_memory)
                     imgs = self.augment(imgs)
 
                     use_mixup = torch.rand(1, device=self.device).item() < self.mixup_prob
@@ -861,12 +1082,18 @@ class ExGAN:
                     with torch.cuda.amp.autocast(enabled=self.amp_enabled):
                         if use_mixup:
                             imgs, labels_a, labels_b, lam = ExGAN.mixup(imgs, labels, alpha=self.mixup_alpha)
-                            _, outputs = self.model(imgs)
-                            loss = lam * self.criterion_train(outputs, labels_a) + (1 - lam) * self.criterion_train(outputs, labels_b)
+                            _, outputs, _ = self.model(imgs)
+                            cls_loss = lam * self.criterion_train(outputs, labels_a) + (1 - lam) * self.criterion_train(outputs, labels_b)
+                            adv_loss = outputs.new_zeros(())
                             labels_for_acc = labels_a
                         else:
-                            _, outputs = self.model(imgs)
-                            loss = self.criterion_train(outputs, labels)
+                            _, outputs, subject_logits = self.model(imgs, subject_lambda=subject_lambda)
+                            cls_loss = self.criterion_train(outputs, labels)
+                            if subject_logits is not None and subject_loss_weight > 0:
+                                adv_loss = self.criterion_subject(subject_logits, subject_labels)
+                            else:
+                                adv_loss = outputs.new_zeros(())
+                        loss = cls_loss + subject_loss_weight * adv_loss
 
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -876,6 +1103,7 @@ class ExGAN:
                     ema.update()
 
                     train_loss += loss.item() * len(imgs)
+                    train_adv_loss += adv_loss.item() * len(imgs)
                     if use_mixup:
                         pred = outputs.argmax(1)
                         mix_acc = lam * (pred == labels_a).float() + (1 - lam) * (pred == labels_b).float()
@@ -885,6 +1113,7 @@ class ExGAN:
 
                 scheduler.step()
                 avg_train_loss = train_loss / len(train_label)
+                avg_train_adv_loss = train_adv_loss / len(train_label)
                 avg_train_acc = train_correct / len(train_label)
 
                 self.model.eval()
@@ -900,7 +1129,7 @@ class ExGAN:
                         v_labels = v_labels.to(self.device, non_blocking=use_pin_memory)
                         v_subjects = v_subjects.to(self.device, non_blocking=use_pin_memory)
                         with torch.cuda.amp.autocast(enabled=self.amp_enabled):
-                            _, v_outputs = self.model(v_imgs)
+                            _, v_outputs, _ = self.model(v_imgs)
                             v_loss = self.criterion_eval(v_outputs, v_labels)
                         val_loss += v_loss.item() * len(v_imgs)
                         val_correct += (v_outputs.argmax(1) == v_labels).sum().item()
@@ -918,7 +1147,7 @@ class ExGAN:
 
                 print(
                     f"Epoch {epoch + 1:3d}/{n_epochs} | "
-                    f"Train Loss: {avg_train_loss:.4f} Acc: {avg_train_acc:.4f} | "
+                    f"Train Loss: {avg_train_loss:.4f} Adv: {avg_train_adv_loss:.4f} Acc: {avg_train_acc:.4f} | "
                     f"Val Loss: {avg_val_loss:.4f} Acc: {avg_val_acc:.4f} Macro: {avg_val_macro_acc:.4f}"
                 )
 
@@ -988,35 +1217,82 @@ class ExGAN:
 
 
 def parse_args():
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--training_mode", choices=["baseline", "full"], default="baseline")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    mode_defaults = {
+        "baseline": {
+            "batch_size": 64,
+            "epochs": 120,
+            "patience": 30,
+            "min_epochs": 50,
+            "val_ratio": 0.125,
+            "n_tta": 1,
+            "use_denoise": False,
+            "aug_noise_std": 0.01,
+            "aug_shift": 8,
+            "channel_mask_prob": 0.05,
+            "channel_drop_prob": 0.0,
+            "mixup_prob": 0.0,
+            "mixup_alpha": 0.2,
+            "label_smoothing": 0.02,
+            "subject_adv_weight": 0.0,
+            "subject_adv_warmup": 0,
+        },
+        "full": {
+            "batch_size": 64,
+            "epochs": 120,
+            "patience": 20,
+            "min_epochs": 40,
+            "val_ratio": 0.25,
+            "n_tta": 1,
+            "use_denoise": True,
+            "aug_noise_std": 0.02,
+            "aug_shift": 12,
+            "channel_mask_prob": 0.15,
+            "channel_drop_prob": 0.08,
+            "mixup_prob": 0.2,
+            "mixup_alpha": 0.2,
+            "label_smoothing": 0.05,
+            "subject_adv_weight": 0.05,
+            "subject_adv_warmup": 8,
+        },
+    }[pre_args.training_mode]
+
     parser = argparse.ArgumentParser(description="EEG-Conformer subject-level 5-fold CV training.")
+    parser.add_argument("--training_mode", choices=["baseline", "full"], default="full")
     parser.add_argument("--data_dir", type=str, default="./EEG-Conformer/data/processed_normal/")
     parser.add_argument("--save_dir", type=str, default="./EEG-Conformer/last_params/")
     parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--emb_size", type=int, default=40)
     parser.add_argument("--depth", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=120)
-    parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--min_epochs", type=int, default=40)
+    parser.add_argument("--batch_size", type=int, default=mode_defaults["batch_size"])
+    parser.add_argument("--epochs", type=int, default=mode_defaults["epochs"])
+    parser.add_argument("--patience", type=int, default=mode_defaults["patience"])
+    parser.add_argument("--min_epochs", type=int, default=mode_defaults["min_epochs"])
     parser.add_argument("--lr", type=float, default=1.5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_seed", type=int, default=-1)
-    parser.add_argument("--val_ratio", type=float, default=0.25)
-    parser.add_argument("--n_tta", type=int, default=1)
+    parser.add_argument("--val_ratio", type=float, default=mode_defaults["val_ratio"])
+    parser.add_argument("--n_tta", type=int, default=mode_defaults["n_tta"])
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--use_denoise", dest="use_denoise", action="store_true")
     parser.add_argument("--no_denoise", dest="use_denoise", action="store_false")
-    parser.set_defaults(use_denoise=True)
+    parser.set_defaults(use_denoise=mode_defaults["use_denoise"])
     parser.add_argument("--disable_amp", action="store_true", default=False)
-    parser.add_argument("--aug_noise_std", type=float, default=0.02)
-    parser.add_argument("--aug_shift", type=int, default=12)
-    parser.add_argument("--channel_mask_prob", type=float, default=0.15)
-    parser.add_argument("--channel_drop_prob", type=float, default=0.08)
-    parser.add_argument("--mixup_prob", type=float, default=0.2)
-    parser.add_argument("--mixup_alpha", type=float, default=0.2)
-    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--aug_noise_std", type=float, default=mode_defaults["aug_noise_std"])
+    parser.add_argument("--aug_shift", type=int, default=mode_defaults["aug_shift"])
+    parser.add_argument("--channel_mask_prob", type=float, default=mode_defaults["channel_mask_prob"])
+    parser.add_argument("--channel_drop_prob", type=float, default=mode_defaults["channel_drop_prob"])
+    parser.add_argument("--mixup_prob", type=float, default=mode_defaults["mixup_prob"])
+    parser.add_argument("--mixup_alpha", type=float, default=mode_defaults["mixup_alpha"])
+    parser.add_argument("--label_smoothing", type=float, default=mode_defaults["label_smoothing"])
     parser.add_argument("--tta_shift", type=int, default=4)
+    parser.add_argument("--sampling_rate", type=int, default=250)
+    parser.add_argument("--subject_adv_weight", type=float, default=mode_defaults["subject_adv_weight"])
+    parser.add_argument("--subject_adv_warmup", type=int, default=mode_defaults["subject_adv_warmup"])
     parser.add_argument("--start_fold", type=int, default=1)
     parser.add_argument("--end_fold", type=int, default=1)
     parser.add_argument("--common_ckpt_name", type=str, default="finetuned_best.pth")
@@ -1057,14 +1333,27 @@ def main():
     print(f"Using device: {device}")
     print(f"Found {n_subjects} subjects: {subject_ids}")
 
-    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=args.emb_size)
+    seq_len = ExGAN.get_seq_len(
+        n_channels=30,
+        n_times=250,
+        emb_size=args.emb_size,
+        sampling_rate=args.sampling_rate,
+    )
     print(f"[Info] seq_len = {seq_len}")
+    print(
+        f"[Mode] {args.training_mode} | "
+        f"val_ratio={args.val_ratio} | denoise={args.use_denoise} | "
+        f"mixup={args.mixup_prob} | mask={args.channel_mask_prob} | drop={args.channel_drop_prob} | "
+        f"label_smoothing={args.label_smoothing} | subject_adv={args.subject_adv_weight} | "
+        f"n_tta={args.n_tta} | patience={args.patience} | min_epochs={args.min_epochs}"
+    )
 
     start_time = datetime.datetime.now()
     model_seed = args.model_seed if args.model_seed >= 0 else args.seed
 
     trainer = ExGAN(
         data_dir=args.data_dir,
+        all_subject_ids=subject_ids,
         seq_len=seq_len,
         depth=args.depth,
         emb_size=args.emb_size,
@@ -1082,6 +1371,9 @@ def main():
         mixup_alpha=args.mixup_alpha,
         label_smoothing=args.label_smoothing,
         tta_shift=args.tta_shift,
+        sampling_rate=args.sampling_rate,
+        subject_adv_weight=args.subject_adv_weight,
+        subject_adv_warmup=args.subject_adv_warmup,
     )
     trainer.run_subject_cv(
         subject_ids=subject_ids,
