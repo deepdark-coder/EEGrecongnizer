@@ -36,37 +36,196 @@ def pick_group_count(num_channels: int, max_groups: int = 8) -> int:
     return 1
 
 
-class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size: int = 40, n_channels: int = 30):
+class LayerScale(nn.Module):
+    def __init__(self, dim: int, init_value: float = 1e-4):
         super().__init__()
-        feat_channels = 64
-        feat_groups = pick_group_count(feat_channels)
-        self.shallownet = nn.Sequential(
-            nn.Conv2d(1, feat_channels, (1, 15), stride=(1, 1), padding=(0, 7), bias=False),
-            nn.GroupNorm(feat_groups, feat_channels),
-            nn.ELU(),
+        self.scale = nn.Parameter(torch.ones(dim) * init_value)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * self.scale
+
+
+class SampleChannelNorm(nn.Module):
+    def __init__(self, n_channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(1, 1, n_channels, 1))
+        self.bias = nn.Parameter(torch.zeros(1, 1, n_channels, 1))
+
+    def forward(self, x: Tensor) -> Tensor:
+        mean = x.mean(dim=-1, keepdim=True)
+        var = (x - mean).pow(2).mean(dim=-1, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        return x * self.weight + self.bias
+
+
+class TemporalBranch(nn.Sequential):
+    def __init__(self, out_channels: int, kernel_size: int, in_channels: int = 1):
+        super().__init__(
             nn.Conv2d(
-                feat_channels,
-                feat_channels,
-                (1, 7),
+                in_channels,
+                out_channels,
+                (1, kernel_size),
                 stride=(1, 1),
-                padding=(0, 3),
-                groups=feat_channels,
+                padding=(0, kernel_size // 2),
                 bias=False,
             ),
-            nn.Conv2d(feat_channels, feat_channels, (n_channels, 1), stride=(1, 1), bias=False),
-            nn.GroupNorm(feat_groups, feat_channels),
+            nn.GroupNorm(pick_group_count(out_channels), out_channels),
             nn.ELU(),
-            nn.AvgPool2d((1, 15), stride=(1, 8)),
-            nn.Dropout(0.3),
         )
-        self.projection = nn.Sequential(
-            nn.Conv2d(feat_channels, emb_size, (1, 1), stride=(1, 1)),
-            Rearrange("b e h w -> b (h w) e"),
+
+
+class SqueezeExcite2d(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        hidden_channels = max(8, channels // reduction)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, 1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, channels, 1, bias=True),
+            nn.Sigmoid(),
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.projection(self.shallownet(x))
+        scale = self.fc(self.pool(x))
+        return x * scale
+
+
+class AdaptiveSpatialAggregator(nn.Module):
+    def __init__(self, in_channels: int, emb_size: int, spatial_heads: int = 2):
+        super().__init__()
+        hidden_channels = max(16, in_channels // 2)
+        self.attn_logits = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, (1, 1), bias=False),
+            nn.GroupNorm(pick_group_count(hidden_channels), hidden_channels),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, spatial_heads, (1, 1), bias=True),
+        )
+        self.value_proj = nn.Sequential(
+            nn.Conv2d(in_channels, emb_size, (1, 1), bias=False),
+            nn.GroupNorm(pick_group_count(emb_size), emb_size),
+            nn.SiLU(),
+        )
+        self.token_dropout = nn.Dropout(0.1)
+        self.token_norm = nn.LayerNorm(emb_size)
+
+    def forward(self, x: Tensor) -> Tensor:
+        logits = self.attn_logits(x)
+        attn = torch.softmax(logits / (x.shape[1] ** 0.5), dim=2)
+        values = self.value_proj(x)
+        pooled = torch.einsum("bhct,bect->beht", attn, values)
+        mean_head = values.mean(dim=2, keepdim=True)
+        max_head = values.amax(dim=2, keepdim=True)
+        tokens = torch.cat([mean_head, max_head, pooled], dim=2)
+        tokens = rearrange(tokens, "b e h t -> b (h t) e")
+        return self.token_norm(self.token_dropout(tokens))
+
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, emb_size: int = 40, n_channels: int = 30):
+        super().__init__()
+        branch_channels = 20
+        temporal_channels = branch_channels * 3
+        spectral_channels = branch_channels * 4
+        feat_channels = 48
+        feat_groups = pick_group_count(feat_channels)
+        self.input_norm = SampleChannelNorm(n_channels)
+        self.temporal_branches = nn.ModuleList(
+            [
+                TemporalBranch(branch_channels, kernel_size=7),
+                TemporalBranch(branch_channels, kernel_size=15),
+                TemporalBranch(branch_channels, kernel_size=31),
+            ]
+        )
+        self.temporal_fuse = nn.Sequential(
+            nn.Conv2d(temporal_channels, feat_channels, (1, 1), stride=(1, 1), bias=False),
+            nn.GroupNorm(feat_groups, feat_channels),
+            nn.ELU(),
+        )
+        self.temporal_context = nn.Sequential(
+            nn.Conv2d(
+                feat_channels,
+                feat_channels,
+                (1, 9),
+                stride=(1, 1),
+                padding=(0, 4),
+                groups=feat_channels,
+                bias=False,
+            ),
+            nn.GroupNorm(feat_groups, feat_channels),
+            nn.SiLU(),
+        )
+        self.channel_reweight = SqueezeExcite2d(feat_channels)
+        self.temporal_pool = nn.Sequential(
+            nn.AvgPool2d((1, 15), stride=(1, 10)),
+            nn.Dropout(0.25),
+        )
+        self.spatial_aggregator = AdaptiveSpatialAggregator(feat_channels, emb_size, spatial_heads=1)
+
+        self.spectral_pointwise = nn.Sequential(
+            nn.Conv2d(1, branch_channels, (1, 1), stride=(1, 1), bias=False),
+            nn.GroupNorm(pick_group_count(branch_channels), branch_channels),
+            nn.SiLU(),
+        )
+        self.spectral_branches = nn.ModuleList(
+            [
+                TemporalBranch(branch_channels, kernel_size=3, in_channels=branch_channels),
+                TemporalBranch(branch_channels, kernel_size=7, in_channels=branch_channels),
+                TemporalBranch(branch_channels, kernel_size=15, in_channels=branch_channels),
+            ]
+        )
+        self.spectral_fuse = nn.Sequential(
+            nn.Conv2d(spectral_channels, feat_channels, (1, 1), stride=(1, 1), bias=False),
+            nn.GroupNorm(feat_groups, feat_channels),
+            nn.ELU(),
+        )
+        self.spectral_context = nn.Sequential(
+            nn.Conv2d(
+                feat_channels,
+                feat_channels,
+                (1, 5),
+                stride=(1, 1),
+                padding=(0, 2),
+                groups=feat_channels,
+                bias=False,
+            ),
+            nn.GroupNorm(feat_groups, feat_channels),
+            nn.SiLU(),
+        )
+        self.spectral_reweight = SqueezeExcite2d(feat_channels)
+        self.spectral_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d((n_channels, 24)),
+            nn.Dropout(0.25),
+        )
+        self.spectral_aggregator = AdaptiveSpatialAggregator(feat_channels, emb_size, spatial_heads=1)
+        self.time_token_type = nn.Parameter(torch.randn(1, 1, emb_size) * 0.02)
+        self.freq_token_type = nn.Parameter(torch.randn(1, 1, emb_size) * 0.02)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.input_norm(x)
+        time_feat = torch.cat([branch(x) for branch in self.temporal_branches], dim=1)
+        time_feat = self.temporal_fuse(time_feat)
+        time_feat = self.temporal_context(time_feat)
+        time_feat = self.channel_reweight(time_feat)
+        time_feat = self.temporal_pool(time_feat)
+        time_tokens = self.spatial_aggregator(time_feat)
+        time_tokens = time_tokens + self.time_token_type
+
+        spectrum = torch.log1p(torch.abs(torch.fft.rfft(x.float(), dim=-1)))[..., 1:]
+        spectral_base = self.spectral_pointwise(spectrum)
+        spectral_feat = torch.cat(
+            [spectral_base] + [branch(spectral_base) for branch in self.spectral_branches],
+            dim=1,
+        )
+        spectral_feat = self.spectral_fuse(spectral_feat)
+        spectral_feat = self.spectral_context(spectral_feat)
+        spectral_feat = self.spectral_reweight(spectral_feat)
+        spectral_feat = self.spectral_pool(spectral_feat)
+        freq_tokens = self.spectral_aggregator(spectral_feat).to(time_tokens.dtype)
+        freq_tokens = freq_tokens + self.freq_token_type
+
+        return torch.cat([time_tokens, freq_tokens], dim=1)
 
 
 class MultiHeadAttention(nn.Module):
@@ -153,40 +312,7 @@ class FeedForwardBlock(nn.Sequential):
         )
 
 
-class ConvolutionModule(nn.Module):
-    def __init__(self, emb_size: int, kernel_size: int = 31, dropout: float = 0.1):
-        super().__init__()
-        self.layer_norm = nn.LayerNorm(emb_size)
-        self.pointwise_conv1 = nn.Conv1d(emb_size, emb_size * 2, 1)
-        self.glu = nn.GLU(dim=1)
-        self.depthwise_conv = nn.Conv1d(
-            emb_size,
-            emb_size,
-            kernel_size,
-            padding=kernel_size // 2,
-            groups=emb_size,
-        )
-        self.channel_norm = nn.GroupNorm(pick_group_count(emb_size), emb_size)
-        self.swish = nn.SiLU()
-        self.pointwise_conv2 = nn.Conv1d(emb_size, emb_size, 1)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        x = self.layer_norm(x)
-        x = x.transpose(1, 2)
-        x = self.pointwise_conv1(x)
-        x = self.glu(x)
-        x = self.depthwise_conv(x)
-        x = self.channel_norm(x)
-        x = self.swish(x)
-        x = self.pointwise_conv2(x)
-        x = self.dropout(x)
-        x = x.transpose(1, 2)
-        return residual + x
-
-
-class ConformerBlock(nn.Module):
+class TokenMixer(nn.Module):
     def __init__(
         self,
         emb_size: int,
@@ -195,55 +321,43 @@ class ConformerBlock(nn.Module):
         forward_expansion: int = 4,
         forward_drop_p: float = 0.1,
         drop_path: float = 0.0,
-        conv_kernel: int = 31,
     ):
         super().__init__()
-        self.ffn1 = ResidualAdd(
-            nn.Sequential(
-                nn.LayerNorm(emb_size),
-                FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
-                nn.Dropout(drop_p),
-                DropPath(drop_path),
-            )
-        )
-        self.mhsa = ResidualAdd(
+        self.attn = ResidualAdd(
             nn.Sequential(
                 nn.LayerNorm(emb_size),
                 MultiHeadAttention(emb_size, num_heads, drop_p),
                 nn.Dropout(drop_p),
+                LayerScale(emb_size),
                 DropPath(drop_path),
             )
         )
-        self.conv = ConvolutionModule(emb_size, conv_kernel, drop_p)
-        self.ffn2 = ResidualAdd(
+        self.ffn = ResidualAdd(
             nn.Sequential(
                 nn.LayerNorm(emb_size),
                 FeedForwardBlock(emb_size, expansion=forward_expansion, drop_p=forward_drop_p),
                 nn.Dropout(drop_p),
+                LayerScale(emb_size),
                 DropPath(drop_path),
             )
         )
         self.final_norm = nn.LayerNorm(emb_size)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = x + 0.5 * self.ffn1.fn(x)
-        x = self.mhsa(x)
-        x = self.conv(x)
-        x = x + 0.5 * self.ffn2.fn(x)
-        x = self.final_norm(x)
-        return x
+        return self.final_norm(self.ffn(self.attn(x)))
 
 
-class ConformerEncoder(nn.Sequential):
-    def __init__(self, depth: int, emb_size: int, drop_path_max: float = 0.2):
+class TransformerEncoder(nn.Sequential):
+    def __init__(self, depth: int, emb_size: int, drop_path_max: float = 0.15):
         drop_path_rates = [drop_path_max * i / (depth - 1) for i in range(depth)] if depth > 1 else [0.0]
-        super().__init__(*[ConformerBlock(emb_size, drop_path=drop_path_rates[i]) for i in range(depth)])
+        super().__init__(*[TokenMixer(emb_size, drop_path=drop_path_rates[i]) for i in range(depth)])
 
 
 class ClassificationHead(nn.Module):
     def __init__(self, emb_size: int, n_classes: int):
         super().__init__()
         hidden_size = max(64, emb_size)
+        self.cls_norm = nn.LayerNorm(emb_size)
         self.token_attention = nn.Sequential(
             nn.LayerNorm(emb_size),
             nn.Linear(emb_size, hidden_size),
@@ -252,33 +366,59 @@ class ClassificationHead(nn.Module):
             nn.Linear(hidden_size, 1),
         )
         self.fc = nn.Sequential(
-            nn.Linear(emb_size * 2, hidden_size),
+            nn.Linear(emb_size * 3, hidden_size),
             nn.ELU(),
             nn.Dropout(0.3),
             nn.Linear(hidden_size, n_classes),
         )
 
     def forward(self, x: Tensor):
-        token_scores = self.token_attention(x)
+        cls_feat = self.cls_norm(x[:, 0])
+        patch_tokens = x[:, 1:]
+        token_scores = self.token_attention(patch_tokens)
         token_weights = torch.softmax(token_scores, dim=1)
-        attn_feat = (token_weights * x).sum(dim=1)
-        mean_feat = x.mean(dim=1)
-        feat = torch.cat([attn_feat, mean_feat], dim=-1)
+        attn_feat = (token_weights * patch_tokens).sum(dim=1)
+        mean_feat = patch_tokens.mean(dim=1)
+        feat = torch.cat([cls_feat, attn_feat, mean_feat], dim=-1)
         return feat, self.fc(feat)
+
+
+class ConvPositionalEncoding(nn.Module):
+    def __init__(self, emb_size: int, kernel_size: int = 3):
+        super().__init__()
+        self.conv = nn.Conv1d(
+            emb_size,
+            emb_size,
+            kernel_size,
+            padding=kernel_size // 2,
+            groups=emb_size,
+            bias=False,
+        )
+        self.norm = nn.GroupNorm(pick_group_count(emb_size), emb_size)
+
+    def forward(self, x: Tensor) -> Tensor:
+        cls_token = x[:, :1]
+        patch_tokens = x[:, 1:]
+        pos = self.conv(patch_tokens.transpose(1, 2))
+        pos = self.norm(pos).transpose(1, 2)
+        return torch.cat([cls_token, patch_tokens + pos], dim=1)
 
 
 class ViT(nn.Module):
     def __init__(self, emb_size: int, depth: int, n_classes: int = 2, n_channels: int = 30, seq_len: int = 11):
         super().__init__()
         self.patch_embedding = PatchEmbedding(emb_size, n_channels)
-        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, emb_size) * 0.02)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, emb_size) * 0.02)
+        self.pos_encoder = ConvPositionalEncoding(emb_size)
         self.pos_drop = nn.Dropout(0.1)
-        self.transformer = ConformerEncoder(depth, emb_size)
+        self.transformer = TransformerEncoder(depth, emb_size)
         self.cls_head = ClassificationHead(emb_size, n_classes)
 
     def forward(self, x: Tensor):
         x = self.patch_embedding(x)
-        x = self.pos_drop(x + self.pos_embedding)
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls_tokens, x], dim=1)
+        x = self.pos_drop(self.pos_encoder(x))
         x = self.transformer(x)
         return self.cls_head(x)
 
