@@ -1,3 +1,7 @@
 .EEG-Conformer/
 EEG-Conformer/data/
 EEG-Conformer/comformer_seed_1s_5fold
+EEG-Conformer/README.md
+EEG-Conformer/__pycache__/
+.tmp_skill_install/
+report/
