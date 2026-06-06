@@ -1,0 +1,5 @@
+EEG-Conformer 5-Fold CV Results
+Folds run: [1]
+Fold accuracies: [0.675000011920929]
+Mean: 67.50% +- 0.00%
+Best shared checkpoint: ./EEG-Conformer/last_params/finetuned_best.pth
