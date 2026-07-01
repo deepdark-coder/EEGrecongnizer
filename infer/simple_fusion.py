@@ -10,6 +10,7 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parent.parent
+TRIALS_PER_SUBJECT = 8
 
 CH_NAMES_30 = [
     "FP1", "FP2", "F7", "F3", "FZ", "F4", "F8",
@@ -61,11 +62,11 @@ def parse_args():
 
     parser.add_argument("--edge_ckpt", type=str, default=str(ROOT / "params" / "edgeconv_best.pth"))
     parser.add_argument("--labram_ckpt", type=str, default=str(ROOT / "params" / "labram_best.pth"))
-    parser.add_argument("--eeg_ckpt", type=str, default=str(ROOT / "EEG-Conformer" / "last_params" / "conformer_D2_H4_S24_best1.pth"))
+    parser.add_argument("--eeg_ckpt", type=str, default=str(ROOT / "EEG-Conformer" / "last_params" / "raw_D2_H4_S24_best1.pth"))
 
     parser.add_argument("--edge_weight", type=float, default=1.0)
     parser.add_argument("--labram_weight", type=float, default=1.0)
-    parser.add_argument("--eeg_weight", type=float, default=1.0)
+    parser.add_argument("--eeg_weight", type=float, default=0.1)
 
     parser.add_argument("--edge_window", type=int, default=40)
     parser.add_argument("--edge_stride", type=int, default=1)
@@ -110,6 +111,30 @@ def load_checkpoint_state_dict(path, extra_keys=None):
         clean_key = key[7:] if key.startswith("module.") else key
         state_dict[clean_key] = value
     return state_dict
+
+
+def infer_conformer_raw_config(state_dict, fallback_emb_size, fallback_depth):
+    emb_size = int(fallback_emb_size)
+    proj_weight = state_dict.get("patch_embedding.projection.0.weight")
+    if proj_weight is not None and getattr(proj_weight, "ndim", 0) >= 1:
+        emb_size = int(proj_weight.shape[0])
+
+    depth_indices = []
+    for key in state_dict:
+        if not key.startswith("transformer."):
+            continue
+        parts = key.split(".")
+        if len(parts) > 1 and parts[1].isdigit():
+            depth_indices.append(int(parts[1]))
+    depth = max(depth_indices) + 1 if depth_indices else int(fallback_depth)
+
+    seq_len = None
+    cls_weight = state_dict.get("cls_head.fc.0.weight")
+    if cls_weight is not None and getattr(cls_weight, "ndim", 0) >= 2 and emb_size > 0:
+        flattened_dim = int(cls_weight.shape[1])
+        if flattened_dim % emb_size == 0:
+            seq_len = flattened_dim // emb_size
+    return emb_size, depth, seq_len
 
 
 def safe_tensor(batch_np, device):
@@ -270,6 +295,51 @@ def sort_mat_key(path):
     return (10**9, path.stem)
 
 
+def build_trial_slices(length, num_trials=TRIALS_PER_SUBJECT):
+    if length < num_trials:
+        raise ValueError(
+            "Expected at least %s samples/windows for trial splitting, got %s"
+            % (num_trials, length)
+        )
+    base = length // num_trials
+    remainder = length % num_trials
+    slices = []
+    start = 0
+    for trial_id in range(1, num_trials + 1):
+        step = base + (1 if trial_id <= remainder else 0)
+        end = start + step
+        slices.append((trial_id, start, end))
+        start = end
+    return slices
+
+
+def majority_label(labels):
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if labels.size == 0:
+        raise ValueError("Cannot compute majority label from an empty label array.")
+    counts = np.bincount(labels)
+    return int(counts.argmax())
+
+
+def merge_label_maps(base_map, new_map, source_name):
+    for key, value in new_map.items():
+        value = int(value)
+        if key in base_map and int(base_map[key]) != value:
+            print(
+                "Warning: conflicting trial labels for %s from %s. Keeping existing=%s, new=%s"
+                % (key, source_name, base_map[key], value)
+            )
+            continue
+        base_map[key] = value
+
+
+def subject_trial_sort_key(key):
+    subject_id, trial_id = key
+    match = re.search(r"(\d+)", str(subject_id))
+    subject_num = int(match.group(1)) if match else 10**9
+    return (subject_num, str(subject_id), int(trial_id))
+
+
 def subject_train_stats(data, labels, subject_seed):
     train_idx_list = []
     for cls in [0, 1]:
@@ -321,14 +391,14 @@ def load_edge_model(args, device):
 
 def run_edge_model(args, model, device, de_subjects):
     scores = {}
+    label_map = {}
     for subject_id, x_file, y_file in de_subjects:
         x = np.load(x_file)
         y = np.load(y_file).astype(np.int64)
         x = zscore_subject(x)
-        for label in sorted(np.unique(y).tolist()):
-            label = int(label)
+        for trial_id, start, end in build_trial_slices(len(x)):
             features = build_de_chunks(
-                x[y == label],
+                x[start:end],
                 args.edge_window,
                 args.edge_stride,
                 args.edge_use_asymmetry,
@@ -336,8 +406,9 @@ def run_edge_model(args, model, device, de_subjects):
             if features is None:
                 continue
             probs = predict_probs(model, features, device, args.batch_size)
-            scores[(subject_id, label)] = float(probs[:, 1].mean())
-    return scores
+            scores[(subject_id, trial_id)] = float(probs[:, 1].mean())
+            label_map[(subject_id, trial_id)] = majority_label(y[start:end])
+    return scores, label_map
 
 
 def load_labram_model(args, device):
@@ -383,13 +454,13 @@ def forward_labram(model, batch, input_chans):
 
 def run_labram_model(args, model, input_chans, device, de_subjects):
     scores = {}
+    label_map = {}
     for subject_id, x_file, y_file in de_subjects:
         x = np.load(x_file).astype(np.float32)
         y = np.load(y_file).astype(np.int64)
-        for label in sorted(np.unique(y).tolist()):
-            label = int(label)
+        for trial_id, start, end in build_trial_slices(len(x)):
             features = build_de_chunks(
-                x[y == label],
+                x[start:end],
                 args.labram_window,
                 args.labram_stride,
                 False,
@@ -403,8 +474,9 @@ def run_labram_model(args, model, input_chans, device, de_subjects):
                 args.batch_size,
                 forward_fn=lambda current_model, batch: forward_labram(current_model, batch, input_chans),
             )
-            scores[(subject_id, label)] = float(probs[:, 1].mean())
-    return scores
+            scores[(subject_id, trial_id)] = float(probs[:, 1].mean())
+            label_map[(subject_id, trial_id)] = majority_label(y[start:end])
+    return scores, label_map
 
 
 def load_eeg_model(args, device):
@@ -412,19 +484,33 @@ def load_eeg_model(args, device):
     if str(eeg_dir) not in sys.path:
         sys.path.insert(0, str(eeg_dir))
 
-    from conformer import ExGAN, ViT
+    from conformer_raw import ExGAN, ViT
 
-    seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=args.eeg_emb_size)
+    state_dict = load_checkpoint_state_dict(args.eeg_ckpt)
+    emb_size, depth, seq_len = infer_conformer_raw_config(
+        state_dict,
+        fallback_emb_size=args.eeg_emb_size,
+        fallback_depth=args.eeg_depth,
+    )
+    if seq_len is None:
+        seq_len = ExGAN.get_seq_len(n_channels=30, n_times=250, emb_size=emb_size)
+    print(
+        "EEG-Conformer raw config: emb_size=%s depth=%s seq_len=%s"
+        % (emb_size, depth, seq_len)
+    )
     model = ViT(
-        emb_size=args.eeg_emb_size,
-        depth=args.eeg_depth,
+        emb_size=emb_size,
+        depth=depth,
         n_classes=2,
         n_channels=30,
         seq_len=seq_len,
     ).to(device)
 
-    state_dict = load_checkpoint_state_dict(args.eeg_ckpt)
-    model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        print("EEG-Conformer unexpected keys ignored:", unexpected)
+    if missing:
+        print("EEG-Conformer missing keys:", missing)
     return model
 
 
@@ -435,29 +521,34 @@ def run_eeg_model(args, model, device, mat_files):
         raise ImportError("EEG-Conformer inference needs scipy for reading .mat files.") from exc
 
     scores = {}
+    label_map = {}
     for mat_path in mat_files:
         subject_id = parse_mat_subject_id(mat_path)
         mat = sio.loadmat(str(mat_path))
         data = np.ascontiguousarray(mat["data"], dtype=np.float32)
-        labels = np.ascontiguousarray(mat["label"].flatten(), dtype=np.int64)
+        labels = None
+        if "label" in mat:
+            labels = np.ascontiguousarray(mat["label"].flatten(), dtype=np.int64)
 
-        subject_seed_match = re.search(r"(\d+)", subject_id)
-        subject_seed = int(subject_seed_match.group(1)) if subject_seed_match else 42
-        mu, std = subject_train_stats(data, labels, subject_seed)
+        if labels is not None:
+            subject_seed_match = re.search(r"(\d+)", subject_id)
+            subject_seed = int(subject_seed_match.group(1)) if subject_seed_match else 42
+            mu, std = subject_train_stats(data, labels, subject_seed)
+        else:
+            mu = data.mean(axis=(0, 2), keepdims=True)
+            std = data.std(axis=(0, 2), keepdims=True) + 1e-8
         data = (data - mu) / std
         data = np.ascontiguousarray(data[:, np.newaxis, :, :], dtype=np.float32)
 
         probs = predict_probs(model, data, device, args.batch_size)
-        for label in sorted(np.unique(labels).tolist()):
-            label = int(label)
-            idx = np.where(labels == label)[0]
-            if len(idx) == 0:
-                continue
-            scores[(subject_id, label)] = float(probs[idx, 1].mean())
-    return scores
+        for trial_id, start, end in build_trial_slices(len(probs)):
+            scores[(subject_id, trial_id)] = float(probs[start:end, 1].mean())
+            if labels is not None:
+                label_map[(subject_id, trial_id)] = majority_label(labels[start:end])
+    return scores, label_map
 
 
-def combine_scores(score_maps, weight_map):
+def combine_scores(score_maps, weight_map, label_map):
     common_keys = None
     for score_map in score_maps.values():
         key_set = set(score_map.keys())
@@ -467,48 +558,55 @@ def combine_scores(score_maps, weight_map):
             common_keys = common_keys & key_set
 
     if not common_keys:
-        raise ValueError("No common (subject_id, label) pairs were found across the selected models.")
+        raise ValueError("No common (user_id, trial_id) pairs were found across the selected models.")
 
     rows = []
-    for subject_id, label in sorted(common_keys):
+    for subject_id, trial_id in sorted(common_keys, key=subject_trial_sort_key):
         row = {
-            "subject_id": subject_id,
-            "label": int(label),
+            "user_id": subject_id,
+            "trial_id": int(trial_id),
         }
         weighted_sum = 0.0
         total_weight = 0.0
         for model_name in score_maps:
-            prob = float(score_maps[model_name][(subject_id, label)])
+            prob = float(score_maps[model_name][(subject_id, trial_id)])
             row[model_name] = prob
             weighted_sum += prob * weight_map[model_name]
             total_weight += weight_map[model_name]
         fused_prob = weighted_sum / total_weight
         row["fused_prob_1"] = fused_prob
-        row["fused_pred"] = 1 if fused_prob >= 0.5 else 0
+        row["Emotion_label"] = 1 if fused_prob >= 0.5 else 0
+        label_key = (subject_id, trial_id)
+        if label_key in label_map:
+            row["target_label"] = int(label_map[label_key])
         rows.append(row)
     return rows
 
 
 def compute_accuracy(rows, column_name):
-    if not rows:
-        return 0.0
+    labeled_rows = [row for row in rows if "target_label" in row]
+    if not labeled_rows:
+        return None
     correct = 0
-    for row in rows:
-        pred = 1 if row[column_name] >= 0.5 else 0
-        if pred == row["label"]:
+    for row in labeled_rows:
+        if column_name == "Emotion_label":
+            pred = int(row["Emotion_label"])
+        else:
+            pred = 1 if row[column_name] >= 0.5 else 0
+        if pred == row["target_label"]:
             correct += 1
-    return correct / len(rows)
+    return correct / len(labeled_rows)
 
 
 def write_rows(rows, model_names, out_csv):
     out_path = Path(out_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["subject_id", "label"] + model_names + ["fused_prob_1", "fused_pred"]
+    fieldnames = ["user_id", "trial_id", "Emotion_label"]
     with out_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow({field: row[field] for field in fieldnames})
 
 
 def main():
@@ -520,6 +618,7 @@ def main():
 
     score_maps = {}
     weight_map = {}
+    label_map = {}
     de_subjects = None
     mat_files = None
 
@@ -536,35 +635,48 @@ def main():
     if args.edge_ckpt:
         print("Loading EdgeConv...")
         edge_model = load_edge_model(args, device)
-        score_maps["edgeconv"] = run_edge_model(args, edge_model, device, de_subjects)
+        edge_scores, edge_labels = run_edge_model(args, edge_model, device, de_subjects)
+        score_maps["edgeconv"] = edge_scores
         weight_map["edgeconv"] = args.edge_weight
+        merge_label_maps(label_map, edge_labels, "edgeconv")
 
     if args.labram_ckpt:
         print("Loading LaBraM...")
         labram_model, input_chans = load_labram_model(args, device)
-        score_maps["labram"] = run_labram_model(args, labram_model, input_chans, device, de_subjects)
+        labram_scores, labram_labels = run_labram_model(args, labram_model, input_chans, device, de_subjects)
+        score_maps["labram"] = labram_scores
         weight_map["labram"] = args.labram_weight
+        merge_label_maps(label_map, labram_labels, "labram")
 
     if args.eeg_ckpt:
         print("Loading EEG-Conformer...")
         eeg_model = load_eeg_model(args, device)
-        score_maps["eeg_conformer"] = run_eeg_model(args, eeg_model, device, mat_files)
+        eeg_scores, eeg_labels = run_eeg_model(args, eeg_model, device, mat_files)
+        score_maps["eeg_conformer"] = eeg_scores
         weight_map["eeg_conformer"] = args.eeg_weight
+        if not label_map:
+            merge_label_maps(label_map, eeg_labels, "eeg_conformer")
 
     if not score_maps:
         raise ValueError("Please provide at least one checkpoint path.")
 
-    rows = combine_scores(score_maps, weight_map)
+    rows = combine_scores(score_maps, weight_map, label_map)
     model_names = list(score_maps.keys())
     write_rows(rows, model_names, args.out_csv)
 
     print("Saved:", args.out_csv)
-    print("Common subject-label pairs:", len(rows))
+    print("Common user-trial pairs:", len(rows))
     for model_name in model_names:
         acc = compute_accuracy(rows, model_name)
-        print("%s group accuracy: %.4f" % (model_name, acc))
-    fused_acc = compute_accuracy(rows, "fused_prob_1")
-    print("fused group accuracy: %.4f" % fused_acc)
+        if acc is None:
+            print("%s trial accuracy: N/A (labels unavailable)" % model_name)
+        else:
+            print("%s trial accuracy: %.4f" % (model_name, acc))
+    fused_acc = compute_accuracy(rows, "Emotion_label")
+    if fused_acc is None:
+        print("fused trial accuracy: N/A (labels unavailable)")
+    else:
+        print("fused trial accuracy: %.4f" % fused_acc)
 
 
 if __name__ == "__main__":

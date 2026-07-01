@@ -244,7 +244,7 @@ class ExGAN:
 
         best_val_acc = 0.0
         patience_counter = 0
-        best_save_path = os.path.join(save_dir, f'D{self.depth}_H4_S{self.emb_size}_best1.pth')
+        best_save_path = os.path.join(save_dir, f'raw_D{self.depth}_H4_S{self.emb_size}_best1.pth')
         
         print(f"  ▶ 全局训练集大小: {len(all_train_data)} | 全局验证集大小: {len(all_val_data)}")
         

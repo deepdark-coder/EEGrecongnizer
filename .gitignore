@@ -5,3 +5,5 @@ EEG-Conformer/README.md
 EEG-Conformer/__pycache__/
 .tmp_skill_install/
 report/
+.codex_tmp
+results
