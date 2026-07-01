@@ -17,6 +17,10 @@ import utils
 from dataset_de_v2 import CompetitionDEDataset
 
 
+gpus = [3]
+os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
+os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpus))
+
 class TeeLogger:
     def __init__(self, p):
         self.t = sys.stdout; self.f = open(p, 'a', encoding='utf-8')
@@ -52,7 +56,7 @@ def run_fold(fold_idx, data_dir, train_files, test_files, extra_dirs, extra_file
     model = create_model(args.model, pretrained=False, num_classes=2, drop_rate=0.0, drop_path_rate=0.1, attn_drop_rate=0.0, use_mean_pooling=True, init_scale=0.001, use_rel_pos_bias=True, use_abs_pos_emb=True, init_values=0.1, qkv_bias=True)
     patch_size = model.patch_size
 
-    ckpt = torch.load(args.finetune, map_location='cpu', weights_only=False)
+    ckpt = torch.load(args.finetune, map_location='cpu')
     ckpt_m = None
     for mk in 'model|module'.split('|'):
         if mk in ckpt: ckpt_m = ckpt[mk]; break
@@ -79,25 +83,35 @@ def run_fold(fold_idx, data_dir, train_files, test_files, extra_dirs, extra_file
     wd_vals = utils.cosine_scheduler(args.weight_decay, wd_end, args.epochs, n_steps)
     crit = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     metrics = ["accuracy","balanced_accuracy","cohen_kappa","f1_weighted"]
+    params_dir = Path(args.params_dir)
+    params_dir.mkdir(parents=True, exist_ok=True)
+    weight_path = params_dir / args.params_filename
 
-    best_test = 0.0
+    best_test = float('-inf')
     for epoch in range(args.epochs):
-        train_one_epoch(model, crit, dl_train, opt, device, epoch, scaler, None, None, start_steps=epoch*n_steps, lr_schedule_values=lr_vals, wd_schedule_values=wd_vals, num_training_steps_per_epoch=n_steps, update_freq=1, ch_names=ch_names, is_binary=False, patch_size=patch_size, scale=1.0)
-        tts = evaluate(dl_test, model, device, 'Test:', ch_names=ch_names, metrics=metrics, is_binary=False, patch_size=patch_size, scale=1.0)
-        if tts["accuracy"] > best_test: best_test = tts["accuracy"]
+        train_one_epoch(model, crit, dl_train, opt, device, epoch, scaler, None, None, start_steps=epoch*n_steps, lr_schedule_values=lr_vals, wd_schedule_values=wd_vals, num_training_steps_per_epoch=n_steps, update_freq=1, ch_names=ch_names, is_binary=False)
+        tts = evaluate(dl_test, model, device, 'Test:', ch_names=ch_names, metrics=metrics, is_binary=False)
+        if tts["accuracy"] > best_test:
+            best_test = tts["accuracy"]
+            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            torch.save(state_dict, weight_path)
+            print(f"  Saved fold {fold_idx+1} best weights to {weight_path} (acc={best_test:.2f}%)")
         if (epoch+1) % 5 == 0:
             print(f"  Fold {fold_idx+1} Epoch {epoch+1}/{args.epochs} | Best Test: {best_test:.2f}%")
 
     print(f"Fold {fold_idx+1} Final Best Test: {best_test:.2f}%")
+    print(f"Fold {fold_idx+1} Best Weights Path: {weight_path}")
     return best_test
 
 
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', default='./de_data')
+    p.add_argument('--data_dir', default='./data/code/normal_processed')
     p.add_argument('--extra_data_dir', nargs='*', default=[], help='extra training-only dirs (e.g. depression)')
     p.add_argument('--output_dir', default='./output_de_cv')
+    p.add_argument('--params_dir', default='./params', help='directory for saved fold weights')
+    p.add_argument('--params_filename', default='labram_best.pth', help='saved weight filename; overwritten across folds')
     p.add_argument('--device', default='cuda')
     p.add_argument('--batch_size', default=32, type=int)
     p.add_argument('--epochs', default=20, type=int)
@@ -106,7 +120,7 @@ def main():
     p.add_argument('--start_fold', default=0, type=int)
     p.add_argument('--end_fold', default=4, type=int)
     p.add_argument('--model', default='labram_base_patch200_200')
-    p.add_argument('--finetune', default='./checkpoints/labram-base.pth')
+    p.add_argument('--finetune', default='./code/LaBraM/checkpoints/labram-base.pth')
     p.add_argument('--num_workers', default=4, type=int)
     p.add_argument('--world_size', default=1, type=int); p.add_argument('--local_rank', default=-1, type=int)
     p.add_argument('--dist_url', default='env://'); p.add_argument('--dist_on_itp', action='store_true')
